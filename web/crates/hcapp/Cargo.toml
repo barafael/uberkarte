@@ -1,0 +1,19 @@
+[package]
+name = "hcapp"
+description = "The HyperCard corpus explorer: a SurrealQL notebook with preset questions (Leptos, client-side)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+leptos = { version = "0.8.22", features = ["csr"] }
+hccore = { workspace = true, features = ["web"] }
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+console_error_panic_hook = "0.1"
+futures = "0.3"
+web-sys = { workspace = true, features = ["Worker", "MessageEvent", "Window", "Location", "History", "KeyboardEvent", "HtmlTextAreaElement"] }

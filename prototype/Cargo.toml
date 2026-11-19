@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["stack-core", "player"]
+exclude = ["spike"]
+
+[profile.release]
+opt-level = 3

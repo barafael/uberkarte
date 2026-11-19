@@ -1,0 +1,12 @@
+[package]
+name = "hccheck"
+description = "Native check: load the corpus exactly as the browser does, run every preset question as the guest, probe writes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hccore = { workspace = true, features = ["engine"] }
+serde_json.workspace = true
+tokio = { version = "1", features = ["macros", "rt"] }

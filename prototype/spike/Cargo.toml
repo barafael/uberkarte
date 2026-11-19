@@ -1,0 +1,10 @@
+[package]
+name = "spike"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+rhai = "1.27"
+
+[profile.release]
+debug = false

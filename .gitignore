@@ -1,0 +1,9 @@
+# SurrealDB's local store and shell history (load.sh rebuilds the store from surql/)
+/data/
+/history.txt
+# Build output
+target/
+/web/crates/hcapp/dist/
+/web/crates/hcapp/public/data/
+# The player's own stacks folder: what you build or change at runtime
+/prototype/stacks/

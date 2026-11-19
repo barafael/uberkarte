@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reader Test</title>
+<style>
+/* One column; facilitator screens are compact, participant screens are large and calm. */
+:root {
+  --bg: #f4f5f2; --fg: #1d2420; --muted: #5e6a63; --line: #c9cfc9; --panel: #ffffff; --code: #eef1ec; --accent: #2f6b4f; --bad: #a3361f;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root { --bg: #151a17; --fg: #e3e8e4; --muted: #9aa7a0; --line: #36413b; --panel: #1d2420; --code: #232b26; --accent: #7cc4a0; --bad: #f08b72; color-scheme: dark; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.55 var(--sans); }
+main { max-width: 880px; margin: 0 auto; padding: 32px 16px 64px; }
+h1 { font-size: 26px; margin: 0 0 6px; } h2 { font-size: 20px; margin: 28px 0 8px; }
+p { margin: 0 0 12px; } .muted { color: var(--muted); font-size: 15px; }
+button { font: inherit; font-size: 15px; padding: 7px 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 600; }
+button:focus-visible, textarea:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+pre { background: var(--code); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; font: 15px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 16px; }
+textarea { width: 100%; min-height: 150px; font: inherit; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg); }
+.context { background: var(--panel); border-left: 4px solid var(--accent); padding: 10px 14px; margin: 0 0 16px; }
+.question { font-weight: 600; font-size: 19px; margin: 6px 0 10px; }
+.step { font: 13px var(--mono); color: var(--muted); letter-spacing: .05em; text-transform: uppercase; }
+table { width: 100%; border-collapse: collapse; font-size: 15px; margin: 8px 0 16px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .04em; }
+td.num { font-variant-numeric: tabular-nums; }
+.answer { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; margin: 8px 0; }
+.answer .meta { font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+.answer .text { white-space: pre-wrap; margin-bottom: 8px; }
+.score button { min-width: 44px; } .score button.on { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+.key { font-size: 14px; color: var(--muted); }
+.verdict { font-weight: 600; } .bad { color: var(--bad); }
+.wide { overflow-x: auto; }
+</style>
+</head>
+<body>
+<main id="app"></main>
+<script>
+const HANDLERS = /*HANDLERS*/[];
+// Group A sees handlers 1 and 3 in braces, 2 and 4 with end blocks; group B the opposite.
+const SYNTAX = { A: ["braces", "end", "braces", "end"], B: ["end", "braces", "end", "braces"] };
+const STORE = "reader-test-v1";
+
+function load() { try { return JSON.parse(localStorage.getItem(STORE)) || { sessions: [] }; } catch { return { sessions: [] }; } }
+function save(db) { try { localStorage.setItem(STORE, JSON.stringify(db)); return true; } catch { return false; } }
+let db = load();
+const app = document.getElementById("app");
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const nextGroup = () => db.sessions.length % 2 === 0 ? "A" : "B";
+
+function home() {
+  const n = db.sessions.length + 1;
+  let group = nextGroup();
+  app.innerHTML = `
+    <h1>Reader test</h1>
+    <p class="muted">For the facilitator. Five people who don't program, one at a time, on this computer. Results stay in this browser; copy them out after each session (Results → Copy results).</p>
+    <p>${db.sessions.length} of 5 sessions done.</p>
+    <div class="row">
+      <button class="primary" id="start">Start session ${n} (group <span id="grp">${group}</span>)</button>
+      <button id="swap">Switch group</button>
+      <button id="results">Results</button>
+    </div>
+    <h2>Before you start</h2>
+    <p class="muted">Hand the computer over at the intro screen. Do not explain any word of the code. Answers are typed by the participant, or by you word for word.</p>`;
+  document.getElementById("swap").onclick = () => { group = group === "A" ? "B" : "A"; document.getElementById("grp").textContent = group; };
+  document.getElementById("start").onclick = () => intro({ participant: n, group, started: new Date().toISOString(), answers: [] });
+  document.getElementById("results").onclick = results;
+}
+
+function intro(session) {
+  app.innerHTML = `
+    <h1>Thank you for helping</h1>
+    <p>You will see four short scripts from a program that makes cards, buttons and games. For each one there is a sentence about where it is used, and one question.</p>
+    <p>This is a test of the scripts, not of you. If something is unclear, that is what we want to find out. Write what you think happens, in your own words. "I don't know" is a fine answer.</p>
+    <button class="primary" id="go">Begin</button>`;
+  document.getElementById("go").onclick = () => show(session, 0);
+}
+
+function show(session, i) {
+  const h = HANDLERS[i], syntax = SYNTAX[session.group][i];
+  const shown = performance.now();
+  app.innerHTML = `
+    <p class="step">Script ${i + 1} of 4</p>
+    <div class="context">${esc(h.context)}</div>
+    <pre>${esc(h[syntax])}</pre>
+    <p class="question">${esc(h.question)}</p>
+    <label for="ans" class="muted">Your answer</label>
+    <textarea id="ans"></textarea>
+    <div class="row" style="margin-top:12px"><button class="primary" id="next">${i < 3 ? "Next script" : "Finish"}</button></div>`;
+  const ta = document.getElementById("ans");
+  window.scrollTo(0, 0);
+  ta.focus({ preventScroll: true });
+  document.getElementById("next").onclick = () => {
+    session.answers.push({ handler: h.n, syntax, text: ta.value.trim(), seconds: Math.round((performance.now() - shown) / 1000), score: null });
+    if (i < 3) return show(session, i + 1);
+    session.finished = new Date().toISOString();
+    db.sessions.push(session);
+    const ok = save(db);
+    app.innerHTML = `<h1>That's all. Thank you.</h1>
+      <p class="muted">Facilitator: ${ok ? "the session is saved in this browser." : "<span class='bad'>this browser did not let the page save. Open Results and copy them now.</span>"}</p>
+      <div class="row"><button class="primary" id="back">Back to the start</button><button id="res">Results</button></div>`;
+    document.getElementById("back").onclick = home;
+    document.getElementById("res").onclick = results;
+  };
+}
+
+function summary() {
+  const answers = db.sessions.flatMap(s => s.answers);
+  const avg = xs => xs.length ? xs.reduce((x, y) => x + y, 0) / xs.length : null;
+  const scores = (pred) => answers.filter(a => a.score !== null && pred(a)).map(a => a.score);
+  return {
+    passCount: db.sessions.filter(s => { const b = s.answers.filter(a => a.syntax === "braces"); return b.length === 2 && b.every(a => a.score === 2); }).length,
+    unscored: db.sessions.filter(s => s.answers.some(a => a.score === null)).length,
+    mean: (n, syn) => { const xs = scores(a => a.handler === n && a.syntax === syn); return xs.length ? `${avg(xs).toFixed(2)} (n=${xs.length})` : "–"; },
+    braces: avg(scores(a => a.syntax === "braces")),
+    end: avg(scores(a => a.syntax === "end")),
+  };
+}
+
+function results() {
+  const s = summary(), n = db.sessions.length;
+  const diff = s.braces !== null && s.end !== null ? s.end - s.braces : null;
+  const verdict = n < 5 ? " (test not complete)" : s.unscored ? " (not all scored)" : s.passCount >= 3 ? ": passes." : ": fails.";
+  app.innerHTML = `
+    <div class="row" style="justify-content:space-between"><h1>Results</h1><button id="back">Back</button></div>
+    <p>${n} session(s). ${s.unscored ? `<span class="bad">${s.unscored} not fully scored.</span>` : n ? "All scored." : ""}</p>
+    <p class="verdict">Pass rule: at least 3 of 5 participants score 2 on both of their braces handlers. Now ${s.passCount} of ${n}${verdict}</p>
+    <p>Mean score: braces ${s.braces === null ? "–" : s.braces.toFixed(2)}, end blocks ${s.end === null ? "–" : s.end.toFixed(2)}.${diff !== null && diff >= 0.5 ? ` <span class="bad">Braces are lower by ${diff.toFixed(2)}: revisit keeping them.</span>` : ""}</p>
+    <div class="wide"><table><thead><tr><th>Handler</th><th>Braces</th><th>End blocks</th></tr></thead><tbody>
+      ${HANDLERS.map(h => `<tr><td>${h.n}. ${esc(h.name)}</td><td class="num">${s.mean(h.n, "braces")}</td><td class="num">${s.mean(h.n, "end")}</td></tr>`).join("")}
+    </tbody></table></div>
+    <h2>Score the answers</h2>
+    <p class="muted">2 = all key points, 1 = the main effect but a key point missing or wrong, 0 = main effect wrong or "don't know".</p>
+    <div id="answers"></div>
+    <h2>Copy out</h2>
+    <div class="row"><button class="primary" id="copy">Copy results</button><span id="copied" class="muted"></span></div>
+    <textarea id="json" readonly style="min-height:90px;margin-top:8px;font:13px var(--mono)"></textarea>
+    <h2>Remove a session</h2>
+    <div class="row" id="del"></div>`;
+  document.getElementById("back").onclick = home;
+  const box = document.getElementById("answers");
+  for (const h of HANDLERS) {
+    const hd = document.createElement("div");
+    hd.innerHTML = `<h2 style="font-size:17px">${h.n}. ${esc(h.name)}</h2><p class="key">Key: ${esc(h.key)}</p>`;
+    box.appendChild(hd);
+    db.sessions.forEach((sess, si) => sess.answers.forEach((a, ai) => {
+      if (a.handler !== h.n) return;
+      const d = document.createElement("div");
+      d.className = "answer";
+      d.innerHTML = `<div class="meta">Participant ${sess.participant} · group ${sess.group} · ${a.syntax === "braces" ? "braces" : "end blocks"} · ${a.seconds} s</div>
+        <div class="text">${esc(a.text || "(no answer)")}</div>
+        <div class="row score">${[0, 1, 2].map(v => `<button data-v="${v}" class="${a.score === v ? "on" : ""}" aria-pressed="${a.score === v}">${v}</button>`).join("")}</div>`;
+      d.querySelectorAll("button").forEach(b => b.onclick = () => { db.sessions[si].answers[ai].score = +b.dataset.v; save(db); results(); });
+      box.appendChild(d);
+    }));
+  }
+  const json = JSON.stringify({ test: "reader-test-v1", sessions: db.sessions }, null, 1);
+  const t = document.getElementById("json");
+  t.value = json;
+  document.getElementById("copy").onclick = async () => {
+    try { await navigator.clipboard.writeText(json); document.getElementById("copied").textContent = "Copied."; }
+    catch { t.focus(); t.select(); document.getElementById("copied").textContent = "Selected: press Ctrl+C."; }
+  };
+  const del = document.getElementById("del");
+  if (!n) del.innerHTML = `<span class="muted">No sessions.</span>`;
+  db.sessions.forEach((sess, si) => {
+    const b = document.createElement("button");
+    b.textContent = `Remove session ${sess.participant}`;
+    b.onclick = () => {
+      if (b.dataset.armed) { db.sessions.splice(si, 1); save(db); results(); return; }
+      b.dataset.armed = "1"; b.textContent = `Click again to remove session ${sess.participant}`; b.classList.add("bad");
+    };
+    del.appendChild(b);
+  });
+}
+
+home();
+</script>
+</body>
+</html>

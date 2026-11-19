@@ -1,0 +1,22 @@
+[package]
+name = "player"
+version = "0.1.0"
+edition = "2021"
+description = "Dioxus player and editor for stacks: the same program browses and edits."
+
+[dependencies]
+stack-core = { path = "../stack-core" }
+dioxus = { version = "0.7.10" }
+web-time = "1"
+base64 = "0.22"
+
+[features]
+default = ["desktop"]
+desktop = ["dioxus/desktop"]
+web = ["dioxus/web"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Window", "Location"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = "2"

@@ -1,0 +1,807 @@
+# H3 keyword coverage: one row per keyword node in surql/70_hypertalk_keywords.surql.
+# class: clean | partial | renamed | missing | na. `ours` must run without error; `test` names a test in path.rs.
+
+[[kw]]
+id = "cmd_add"
+cls = "clean"
+ours = "put 5 into n; add 3 to n; subtract 1 from n; multiply n by 2; divide n by 7; add 1 to field \"search\";"
+
+[[kw]]
+id = "cmd_answer"
+cls = "partial"
+ours = "answer \"hi\"; answer \"Save?\" with \"Yes\" or \"No\";"
+note = "the clicked button arrives as an answered message, not in it"
+
+[[kw]]
+id = "cmd_ask"
+cls = "partial"
+ours = "ask \"Name?\" with \"Ada\";"
+note = "the reply arrives as an asked message, not in it"
+test = "dialogs_reply_by_message"
+
+[[kw]]
+id = "cmd_choose"
+cls = "na"
+note = "tools are edit/browse modes of the player, not script-selectable"
+
+[[kw]]
+id = "cmd_clickdrag"
+cls = "partial"
+ours = "click at \"370,70\"; select after text of field \"notes\"; type \"!\";"
+note = "click at and type; no drag"
+
+[[kw]]
+id = "cmd_convert"
+cls = "clean"
+ours = "put \"11/19/26\" into d; convert d to seconds; convert d to long date; convert d to dateItems;"
+note = "UTC"
+
+[[kw]]
+id = "cmd_create"
+cls = "partial"
+ours = "create button \"Extra\"; create field;"
+note = "buttons, fields, folders; not stacks or menus"
+
+[[kw]]
+id = "cmd_do"
+cls = "clean"
+ours = "do \"put 9 into q\";"
+
+[[kw]]
+id = "cmd_domenu"
+cls = "na"
+note = "no menu bar"
+
+[[kw]]
+id = "cmd_edit"
+cls = "clean"
+ours = "edit the script of button \"Hello\";"
+
+[[kw]]
+id = "cmd_enable"
+cls = "clean"
+ours = "disable button \"Hello\"; enable button \"Hello\";"
+note = "buttons; no menus"
+
+[[kw]]
+id = "cmd_exit"
+cls = "partial"
+ours = "repeat { exit repeat; }"
+note = "exit <handler>, exit repeat; no exit to hypercard"
+
+[[kw]]
+id = "cmd_find"
+cls = "partial"
+ours = "find \"Hop\"; find whole \"first published\"; find word \"Grace\"; find chars \"card\" in field \"notes\"; find string \"ace H\";"
+note = "all five forms and in field; not of marked cards"
+
+[[kw]]
+id = "cmd_get"
+cls = "clean"
+ours = "get 3 * 4; put it into x;"
+
+[[kw]]
+id = "cmd_go"
+cls = "clean"
+ours = "go next; go prev; go to card 1; go to card \"card 1\"; go next card; go to card \"nope\";"
+note = "also go to stack, go to card … of stack …, in a new window (a tab)"
+test = "libraries_and_other_stacks"
+
+[[kw]]
+id = "cmd_hide"
+cls = "clean"
+ours = "hide button \"Hello\"; show button \"Hello\";"
+
+[[kw]]
+id = "cmd_lockscreen"
+cls = "clean"
+ours = "lock screen; unlock screen with dissolve;"
+
+[[kw]]
+id = "cmd_fileio"
+cls = "clean"
+note = "open/read/write/close file, whole files, folders; real files on desktop, browser storage on the web"
+test = "file_io"
+
+[[kw]]
+id = "cmd_play"
+cls = "clean"
+ours = "play \"harpsichord\" tempo 200 \"c4q e g c5h\"; play stop;"
+note = "notes are synthesized (harpsichord, boing, others a plain tone)"
+
+[[kw]]
+id = "cmd_pushpop"
+cls = "clean"
+ours = "push card; push this card; pop card; pop card;"
+
+[[kw]]
+id = "cmd_put"
+cls = "clean"
+ours = "put 5 * 4 into x; put \"a\" before x; put \"!\" after field \"notes\"; put \"B\" into item 2 of line 1 of field \"notes\";"
+
+[[kw]]
+id = "cmd_select"
+cls = "partial"
+ours = "select line 1 of field \"notes\"; select before text of field \"notes\"; select word 1 to 2 of field \"notes\"; select empty;"
+note = "one chunk level (not item 2 of line 3)"
+
+[[kw]]
+id = "cmd_send"
+cls = "clean"
+ours = "send \"help\"; send \"help\" to stack; send \"help\" to button \"Hello\";"
+
+[[kw]]
+id = "cmd_set"
+cls = "clean"
+ours = "set name of button \"Hello\" to \"Hi\"; set name of button \"Hi\" to \"Hello\";"
+
+[[kw]]
+id = "cmd_show"
+cls = "clean"
+ours = "show button \"Hello\";"
+
+[[kw]]
+id = "cmd_sort"
+cls = "partial"
+ours = "sort cards descending by field \"name\"; sort by word 2 of field \"name\";"
+note = "cards only; not the lines of a field"
+
+[[kw]]
+id = "cmd_startusing"
+cls = "clean"
+note = "start using / stop using stack; libraryStack, releaseStack, the stacksInUse"
+test = "libraries_and_other_stacks"
+
+[[kw]]
+id = "cmd_visual"
+cls = "renamed"
+ours = "go next with wipe left;"
+note = "go … with <effect> instead of a separate visual effect command"
+
+[[kw]]
+id = "cmd_wait"
+cls = "renamed"
+ours = "send \"help\" in 2 seconds;"
+note = "send … in N seconds|ticks; scripts cannot pause"
+
+[[kw]]
+id = "cmd_mark"
+cls = "clean"
+ours = "mark this card; unmark all cards; mark cards where the number of this card > 1; mark cards by finding \"Ada\"; mark all cards;"
+
+[[kw]]
+id = "fn_value"
+cls = "clean"
+ours = "put value(\"2 + 2\") into n;"
+
+[[kw]]
+id = "fn_length"
+cls = "clean"
+ours = "put length(\"abc\") into n;"
+
+[[kw]]
+id = "fn_offset"
+cls = "clean"
+ours = "put offset(\"lo\", \"hello\") into n;"
+
+[[kw]]
+id = "fn_numberof"
+cls = "clean"
+ours = "put the number of cards into n; put the number of buttons into b; put the number of lines of field \"notes\" into l; put the number of card into c;"
+note = "of, not in"
+
+[[kw]]
+id = "fn_random"
+cls = "clean"
+ours = "put random(6) into n;"
+
+[[kw]]
+id = "fn_math"
+cls = "clean"
+ours = "put sqrt(16) + abs(-1) + round(2.6) + trunc(2.6) + max(\"1,7,3\") + min(2, 4) + sum(\"1,2\") + average(2, 4) into n;"
+
+[[kw]]
+id = "fn_charnum"
+cls = "clean"
+ours = "put charToNum(\"A\") & numToChar(66) into s;"
+
+[[kw]]
+id = "fn_finance"
+cls = "clean"
+ours = "put annuity(0.1, 2) + compound(0.1, 2) into n;"
+
+[[kw]]
+id = "fn_params"
+cls = "clean"
+note = "param(n), paramCount()"
+test = "vocabulary_batch"
+
+[[kw]]
+id = "fn_datetime"
+cls = "clean"
+ours = "put the date & the time & the long date & the abbreviated date & the long time & the seconds & the ticks into t;"
+note = "local time from the player; seconds since 1904"
+
+[[kw]]
+id = "fn_mouse"
+cls = "clean"
+ours = "put the mouse & the mouseLoc & the mouseClick & the mouseH & the mouseV into p;"
+
+[[kw]]
+id = "fn_keys"
+cls = "clean"
+ours = "put the commandKey & the shiftKey & the optionKey into k;"
+
+[[kw]]
+id = "fn_result"
+cls = "partial"
+ours = "go to card \"nope\"; put the result into r; find \"zzz\"; put the result into r;"
+note = "set by go and find only"
+
+[[kw]]
+id = "fn_tool"
+cls = "na"
+note = "see choose"
+
+[[kw]]
+id = "fn_version"
+cls = "clean"
+ours = "put the version into v;"
+
+[[kw]]
+id = "fn_env"
+cls = "partial"
+ours = "put the stacks & the stacksInUse into s;"
+note = "the stacks (open tabs), the stacksInUse; no windows, menus, diskSpace"
+
+[[kw]]
+id = "fn_click"
+cls = "clean"
+ours = "put the clickLoc & the clickText & the clickLine & the clickChunk into p;"
+note = "clickText/Line/Chunk after a click in a locked field"
+test = "upgrades_to_full_hypertalk_forms"
+
+[[kw]]
+id = "fn_selected"
+cls = "clean"
+ours = "select line 1 of field \"notes\"; put the selectedText & the selectedField & the selectedChunk & the selectedLine into s;"
+
+[[kw]]
+id = "ctl_if"
+cls = "clean"
+ours = "if 1 = 1 then put 1 into x else put 2 into x"
+note = "if … then … else … end if, or braces"
+test = "hypertalk_block_syntax"
+
+[[kw]]
+id = "ctl_repeat"
+cls = "clean"
+ours = "repeat with i = 1 to 3 { } repeat with j = 3 down to 1 { } put 0 into n; repeat while n < 2 { add 1 to n; } repeat until n > 3 { add 1 to n; } repeat 2 times { } repeat { exit repeat; }"
+note = "also repeat … end repeat, repeat for N times"
+test = "hypertalk_block_syntax"
+
+[[kw]]
+id = "ctl_exit"
+cls = "clean"
+note = "exit <handler>"
+test = "upgrades_to_full_hypertalk_forms"
+
+[[kw]]
+id = "ctl_exitrepeat"
+cls = "clean"
+ours = "repeat { exit repeat; }"
+
+[[kw]]
+id = "ctl_nextrepeat"
+cls = "clean"
+ours = "repeat with i = 1 to 3 { next repeat; }"
+
+[[kw]]
+id = "ctl_pass"
+cls = "clean"
+note = "pass and pass <message>"
+test = "vocabulary_batch"
+
+[[kw]]
+id = "ctl_return"
+cls = "clean"
+ours = "fn f() { return 2; } put f() into x;"
+
+[[kw]]
+id = "ctl_global"
+cls = "clean"
+test = "breakout_runs"
+
+[[kw]]
+id = "ctl_on"
+cls = "clean"
+note = "on name … end name, or braces"
+test = "hypertalk_block_syntax"
+
+[[kw]]
+id = "ctl_function"
+cls = "clean"
+note = "function handlers anywhere on the message path (card, background, stack, libraries, Home); return gives the value"
+test = "function_handlers_and_user_commands_travel_the_path"
+
+[[kw]]
+id = "ctl_comment"
+cls = "clean"
+ours = "-- a comment\nput 1 into x; // also a comment"
+
+[[kw]]
+id = "ctl_continue"
+cls = "clean"
+note = "¬ continues a line"
+test = "hypertalk_block_syntax"
+
+[[kw]]
+id = "chk_character"
+cls = "clean"
+ours = "put character 2 of \"xyz\" & char 1 of \"abc\" into c;"
+
+[[kw]]
+id = "chk_word"
+cls = "clean"
+ours = "put word 2 of \"a b c\" into w;"
+
+[[kw]]
+id = "chk_item"
+cls = "clean"
+ours = "set the itemDelimiter to \"|\"; put item 2 of \"a|b\" into w; set the itemDelimiter to \",\";"
+
+[[kw]]
+id = "chk_line"
+cls = "clean"
+ours = "put line 1 of field \"notes\" into l;"
+
+[[kw]]
+id = "chk_ordinal"
+cls = "clean"
+ours = "put \"a b c\" into x; put first word of x & the last word of x & the middle item of \"a,b,c\" & second char of \"xyz\" into y;"
+note = "first…tenth, last, middle, any"
+
+[[kw]]
+id = "chk_range"
+cls = "clean"
+ours = "put \"abcdef\" into x; put \"XY\" into char 2 to 4 of x; put char 1 to 3 of x into y;"
+
+[[kw]]
+id = "obj_card"
+cls = "clean"
+ours = "put the name of card & the name of card 2 & the name of card \"card 3\" into n;"
+
+[[kw]]
+id = "obj_background"
+cls = "clean"
+ours = "put the name of background & the name of background 1 into n;"
+
+[[kw]]
+id = "obj_button"
+cls = "clean"
+ours = "put the name of button \"Hello\" into n; put the name of button 1 into m;"
+
+[[kw]]
+id = "obj_field"
+cls = "clean"
+ours = "put field \"name\" into n; put field 1 into m;"
+
+[[kw]]
+id = "obj_stack"
+cls = "partial"
+ours = "put the name of stack & the name of this stack into n; send \"help\" to stack;"
+note = "this stack, and other stacks for go / start using; no references into other stacks (card 1 of stack \"x\")"
+
+[[kw]]
+id = "obj_this"
+cls = "clean"
+ours = "put the name of this card & the name of this background & the name of this stack into n;"
+
+[[kw]]
+id = "obj_part"
+cls = "clean"
+ours = "put the name of part 1 & the name of part \"Hello\" into n;"
+
+[[kw]]
+id = "obj_window"
+cls = "na"
+
+[[kw]]
+id = "obj_menu"
+cls = "na"
+
+[[kw]]
+id = "obj_id"
+cls = "clean"
+ours = "put the id of this card into i; put the name of card id (i) into n;"
+note = "button id 7, card id 3"
+
+[[kw]]
+id = "sp_me"
+cls = "clean"
+ours = "put the name of me into n;"
+
+[[kw]]
+id = "sp_it"
+cls = "partial"
+ours = "get 5; put it into x;"
+note = "filled by get; answer and ask do not fill it"
+
+[[kw]]
+id = "sp_target"
+cls = "clean"
+ours = "put the target into t;"
+
+[[kw]]
+id = "sp_selection"
+cls = "clean"
+ours = "select line 1 of field \"notes\"; put the selection into s; put \"new\" into the selection;"
+
+[[kw]]
+id = "op_arith"
+cls = "clean"
+ours = "put \"41\" + 1 - 2 * 3 / 3 + 7 div 2 + 7 mod 3 into n;"
+
+[[kw]]
+id = "op_power"
+cls = "clean"
+ours = "put 2 ^ 10 into n;"
+
+[[kw]]
+id = "op_concat"
+cls = "clean"
+ours = "put \"a\" & 1 & \"b\" && \"c\" into s; if \"a\" & \"b\" is \"ab\" { put 1 into x; }"
+note = "& and && at HyperTalk precedence; && joins with a space"
+
+[[kw]]
+id = "op_compare"
+cls = "clean"
+ours = "if \"5\" = 5 and 1 <> 2 and \"a\" is not \"b\" and 3 = 3 { put 1 into x; } if 1 == 1 and 2 != 3 { put 1 into x; }"
+note = "= and <> compare (== and != also work); x = … at the start of a statement still assigns"
+
+[[kw]]
+id = "op_verbal"
+cls = "clean"
+ours = "if \"ABC\" contains \"b\" and \"b\" is in \"abc\" and \"5,5\" is within \"0,0,10,10\" { put 1 into x; }"
+
+[[kw]]
+id = "op_typetest"
+cls = "clean"
+ours = "if \"12\" is a number and 5 is an integer and \"1,2\" is a point and \"\" is empty { put 1 into x; }"
+
+[[kw]]
+id = "op_thereis"
+cls = "clean"
+ours = "if there is a card \"card 2\" and there is not a button \"Nope\" { put 1 into x; }"
+
+[[kw]]
+id = "op_logic"
+cls = "clean"
+ours = "if true and not false or false { put 1 into x; } if not (1 = 2) { put 2 into x; }"
+note = "and, or, not with HyperTalk precedence (not binds tightest)"
+
+[[kw]]
+id = "op_precedence"
+cls = "partial"
+ours = "put 2 + 3 * 4 into n; if \"a\" & \"b\" = \"ab\" and not false { put 1 into x; }"
+note = "HyperTalk order for & && and not; the rest is Rhai's table (very close: ^ * / + - comparisons and or)"
+
+[[kw]]
+id = "con_empty"
+cls = "clean"
+ours = "put empty into x; if x is empty { put 1 into y; }"
+
+[[kw]]
+id = "con_pi"
+cls = "clean"
+ours = "put pi into p;"
+
+[[kw]]
+id = "con_whitespace"
+cls = "clean"
+ours = "put space & tab & quote & lineFeed & comma & return into s;"
+note = "return as a constant where a statement does not start"
+
+[[kw]]
+id = "con_numbers"
+cls = "clean"
+ours = "put three + two + zero + ten into n;"
+
+[[kw]]
+id = "con_booleans"
+cls = "clean"
+ours = "put true into t; put false into f;"
+
+[[kw]]
+id = "con_mousestate"
+cls = "clean"
+ours = "if the mouse is up { put down into d; }"
+
+[[kw]]
+id = "msg_startup"
+cls = "clean"
+note = "sent by the player at launch"
+test = "vocabulary_batch"
+
+[[kw]]
+id = "msg_quit"
+cls = "missing"
+
+[[kw]]
+id = "msg_suspend"
+cls = "na"
+
+[[kw]]
+id = "msg_idle"
+cls = "renamed"
+note = "frame, sent on cards with a canvas"
+test = "breakout_runs"
+
+[[kw]]
+id = "msg_mousedown"
+cls = "clean"
+note = "sent by the player"
+test = "vocabulary_batch"
+
+[[kw]]
+id = "msg_mouseup"
+cls = "clean"
+note = "sent by the player; checked in the browser runs"
+test = "pillars_puzzle"
+
+[[kw]]
+id = "msg_mousestillsdown"
+cls = "clean"
+note = "every frame while a part is held"
+test = "player_message_names"
+
+[[kw]]
+id = "msg_mouseenter"
+cls = "clean"
+note = "mouseEnter / mouseLeave sent by the player"
+test = "vocabulary_batch"
+
+[[kw]]
+id = "msg_mousewithin"
+cls = "clean"
+note = "every frame while the pointer is over a part"
+test = "player_message_names"
+
+[[kw]]
+id = "msg_mousedoubleclick"
+cls = "clean"
+note = "the second click sends only mouseDoubleClick, as in HyperCard 2.2"
+test = "player_message_names"
+
+[[kw]]
+id = "msg_keydown"
+cls = "clean"
+note = "sent by the player with the key"
+test = "vocabulary_batch"
+
+[[kw]]
+id = "msg_functionkey"
+cls = "na"
+
+[[kw]]
+id = "msg_commandkeydown"
+cls = "clean"
+note = "Ctrl or Cmd with a key"
+test = "player_message_names"
+
+[[kw]]
+id = "msg_returnkey"
+cls = "clean"
+note = "sent by the player to the field; a handler stops the newline"
+test = "player_message_names"
+
+[[kw]]
+id = "msg_enterinfield"
+cls = "clean"
+note = "keypad Enter in a field"
+test = "player_message_names"
+
+[[kw]]
+id = "msg_domenu"
+cls = "na"
+
+[[kw]]
+id = "msg_go"
+cls = "clean"
+test = "live_edit_intercept_and_capability"
+
+[[kw]]
+id = "msg_openstack"
+cls = "clean"
+test = "vocabulary_batch"
+
+[[kw]]
+id = "msg_suspendstack"
+cls = "clean"
+note = "suspendStack when switching away, resumeStack when coming back"
+test = "player_message_names"
+
+[[kw]]
+id = "msg_opencard"
+cls = "clean"
+test = "navigation_and_per_card_text"
+
+[[kw]]
+id = "msg_openbg"
+cls = "clean"
+note = "openBackground / closeBackground when the background changes"
+test = "vocabulary_batch"
+
+[[kw]]
+id = "msg_newcard"
+cls = "clean"
+note = "sent to the new card after new card"
+test = "vocabulary_batch"
+
+[[kw]]
+id = "msg_openfield"
+cls = "clean"
+note = "openField; closeField when the text changed, exitField when not"
+test = "player_message_names"
+
+[[kw]]
+id = "msg_newpart"
+cls = "clean"
+note = "newButton / newField when the editor adds a part"
+test = "player_message_names"
+
+[[kw]]
+id = "msg_appleevent"
+cls = "na"
+
+[[kw]]
+id = "msg_arrowkey"
+cls = "clean"
+note = "sent by the player; left/right go to the previous/next card if not handled"
+test = "vocabulary_batch"
+
+[[kw]]
+id = "prop_name"
+cls = "clean"
+ours = "put the name of me into n;"
+
+[[kw]]
+id = "prop_id"
+cls = "clean"
+ours = "put the id of me into n;"
+
+[[kw]]
+id = "prop_style"
+cls = "clean"
+ours = "set the style of button \"Hello\" to \"checkBox\"; set the style of button \"Hello\" to \"shadow\"; set the style of field \"notes\" to \"scrolling\";"
+
+[[kw]]
+id = "prop_enabled"
+cls = "clean"
+ours = "set the enabled of button \"Hello\" to false; set enabled of button \"Hello\" to true;"
+
+[[kw]]
+id = "prop_visible"
+cls = "clean"
+ours = "set visible of button \"Hello\" to false; set visible of button \"Hello\" to true;"
+
+[[kw]]
+id = "prop_showname"
+cls = "clean"
+ours = "set the showName of button \"Hello\" to false;"
+
+[[kw]]
+id = "prop_hilite"
+cls = "clean"
+ours = "set the hilite of button \"Hello\" to true;"
+
+[[kw]]
+id = "prop_locktext"
+cls = "clean"
+ours = "set the lockText of field \"notes\" to true;"
+
+[[kw]]
+id = "prop_dontwrap"
+cls = "clean"
+ours = "set the dontWrap of field \"notes\" to true;"
+
+[[kw]]
+id = "prop_sharedtext"
+cls = "clean"
+ours = "put the sharedText of field \"status\" into s;"
+
+[[kw]]
+id = "prop_autoselect"
+cls = "missing"
+
+[[kw]]
+id = "prop_autohilite"
+cls = "clean"
+ours = "set the autoHilite of button \"Hello\" to false;"
+
+[[kw]]
+id = "prop_rect"
+cls = "clean"
+ours = "put the rect of button \"Hello\" into r; set the loc of button \"Hello\" to \"100,100\"; set the rect of button \"Hello\" to \"1,2,30,40\";"
+note = "rect and loc, as comma lists"
+
+[[kw]]
+id = "prop_marked"
+cls = "clean"
+ours = "set the marked of card 1 to true;"
+
+[[kw]]
+id = "prop_script"
+cls = "clean"
+ours = "put the script of button \"Hello\" into s; set the script of button \"Hello\" to s;"
+note = "a script can write a script; compiled at once, undoable"
+
+[[kw]]
+id = "prop_owner"
+cls = "clean"
+ours = "put the owner of this card into o;"
+
+[[kw]]
+id = "prop_number"
+cls = "clean"
+ours = "put the number of card into n; put the number of button \"Hello\" into m;"
+
+[[kw]]
+id = "prop_icon"
+cls = "partial"
+ours = "set the icon of button \"Hello\" to \"glow\";"
+note = "names a picture in the stack, not an icon number"
+
+[[kw]]
+id = "prop_lockscreen"
+cls = "clean"
+ours = "set the lockScreen to true; set lockScreen to false;"
+
+[[kw]]
+id = "prop_lockmessages"
+cls = "clean"
+ours = "set the lockMessages to true; go next;"
+
+[[kw]]
+id = "prop_lockrecent"
+cls = "na"
+note = "no Recent list"
+
+[[kw]]
+id = "prop_blindtyping"
+cls = "na"
+
+[[kw]]
+id = "prop_itemdelimiter"
+cls = "clean"
+ours = "set the itemDelimiter to \"|\"; set the itemDelimiter to \",\";"
+
+[[kw]]
+id = "prop_userlevel"
+cls = "partial"
+ours = "set the userLevel to 4; set the userLevel to 5;"
+note = "1 browse, 2 type, 4 author, 5 script; no painting level (3 acts as 2); kept in Home"
+
+[[kw]]
+id = "msg_resize"
+cls = "partial"
+note = "sizeWindow when the player window is resized; no moveWindow"
+test = "player_message_names"
+
+[[kw]]
+id = "msg_doerror"
+cls = "clean"
+note = "errorDialog takes the error text"
+test = "vocabulary_batch"
+
+[[kw]]
+id = "prop_family"
+cls = "clean"
+ours = "set the family of button \"Prev\" to 1;"
+test = "timers_sort_push_ids_family_edit"
+
+[[kw]]
+id = "prop_pict"
+cls = "clean"
+ours = "set the showPict of this card to false; set the showPict of this card to true;"
+note = "hides the pictures on that card or background"

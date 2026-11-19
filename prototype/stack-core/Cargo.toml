@@ -1,0 +1,19 @@
+[package]
+name = "stack-core"
+version = "0.1.0"
+edition = "2021"
+description = "Stack model, change journal, file format and message-path script engine. No UI."
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dependencies]
+rhai = { version = "1.27", features = ["internals"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+web-time = "1"
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rhai = { version = "1.27", features = ["internals", "wasm-bindgen"] }

@@ -1,0 +1,86 @@
+# Build the corpus explorer (web/) and the stack player (prototype/player) and publish them to GitHub Pages:
+#   https://<owner>.github.io/<repo>/          the explorer: SurrealDB in the browser, a notebook, preset questions
+#   https://<owner>.github.io/<repo>/player/   the player (Dioxus, web build)
+# Nothing runs on a server; see web/README.md.
+name: Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  TRUNK_VERSION: v0.21.14
+  BINARYEN_VERSION: version_116
+  DIOXUS_CLI_VERSION: 0.7.10
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: pages
+        uses: actions/configure-pages@v6
+
+      - name: Rust (stable, wasm32)
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            web -> target
+            prototype -> target
+          cache-targets: true
+
+      - name: Trunk, wasm-opt and the Dioxus CLI
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.local/bin"
+          curl -sSfL "https://github.com/WebAssembly/binaryen/releases/download/${BINARYEN_VERSION}/binaryen-${BINARYEN_VERSION}-x86_64-linux.tar.gz" | tar -xz -C "$RUNNER_TEMP"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/binaryen-${BINARYEN_VERSION}/bin" >> "$GITHUB_PATH"
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall -y --force "dioxus-cli@${DIOXUS_CLI_VERSION}"
+
+      - name: Stack engine tests
+        working-directory: prototype
+        run: cargo test --release -p stack-core
+
+      - name: Explorer
+        # configure-pages gives e.g. "/hypercard-corpus"; Trunk wants a trailing slash.
+        run: PUBLIC_URL="${{ steps.pages.outputs.base_path }}/" web/build.sh
+
+      - name: Player
+        working-directory: prototype/player
+        run: |
+          base="${{ steps.pages.outputs.base_path }}"
+          dx build --platform web --release --no-default-features --features web --base-path "${base#/}/player"
+          mkdir -p ../../web/crates/hcapp/dist/player
+          cp -r ../target/dx/player/release/web/public/. ../../web/crates/hcapp/dist/player/
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: web/crates/hcapp/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
