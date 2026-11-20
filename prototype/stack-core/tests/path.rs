@@ -665,8 +665,8 @@ fn selection_click_type_create_convert_part_userlevel() {
     rt.exec(r#"put "one" & lineFeed & "two,three" & lineFeed & "four" into field "notes";"#); no_error(&rt);
     rt.exec(r#"select line 2 of field "notes"; put the selection into field "search";"#); no_error(&rt);
     assert_eq!(field(&rt, "search"), "two,three");
-    rt.exec(r#"select item 2 of line 2 of field "notes";"#);
-    assert!(rt.w.borrow().last_error.is_some(), "nested chunks are not supported by select");
+    rt.exec(r#"select item 2 of line 2 of field "notes"; put the selection into field "search";"#); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "three", "nested chunks");
     rt.exec(r#"select word 1 to 2 of field "notes"; put the selectedText into field "search";"#); no_error(&rt);
     assert_eq!(field(&rt, "search"), "one\ntwo,three");
     // type replaces the selection, then continues at the caret.
@@ -1032,4 +1032,86 @@ fn self_test_stack_passes() {
     assert!(!out.contains("FAIL"), "{out}");
     assert!(out.contains(" passed, 0 failed."), "{out}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sort_lines_and_items_of_containers() {
+    let rt = Rt::new(demo::address_book());
+    rt.exec("put \"pear\" & return & \"Apple\" & return & \"fig\" into field \"notes\"\nsort lines of field \"notes\""); no_error(&rt);
+    assert_eq!(field(&rt, "notes"), "Apple\nfig\npear");
+    rt.exec(r#"put "10,9,100,x,2" into v; sort items of v descending numeric; put v into field "search";"#); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "x,100,10,9,2", "not-a-number sorts after numbers; descending reverses");
+    // by <expr of each>, stable: equal keys keep their order.
+    rt.exec("put \"b 2\" & return & \"a 1\" & return & \"c 2\" & return & \"d 1\" into field \"notes\"\nsort field \"notes\" numeric by word 2 of each"); no_error(&rt);
+    assert_eq!(field(&rt, "notes"), "a 1\nd 1\nb 2\nc 2");
+    rt.exec(r#"put "12/1/26,1/5/25,3/3/26" into d; sort items of d dateTime; put d into field "search";"#); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "1/5/25,3/3/26,12/1/26");
+    // A handler in HyperTalk style, with a local in the key; sorting cards still works.
+    let card = rt.w.borrow().current_card();
+    rt.set_script(card, "on sortIt\n  put 2 into n\n  put \"x,b\" & return & \"y,a\" into t\n  sort lines of t by item n of each\n  put t into field \"notes\"\nend sortIt");
+    assert_eq!(rt.script_error(card), None);
+    rt.send(card, "sortIt"); no_error(&rt);
+    assert_eq!(field(&rt, "notes"), "y,a\nx,b");
+    rt.exec(r#"sort cards descending by field "name";"#); no_error(&rt);
+}
+
+#[test]
+fn select_nested_chunks_and_exit_to_hypercard() {
+    let rt = Rt::new(demo::address_book());
+    rt.exec("put \"a,b,c\" & return & \"dd,ee,ff\" into field \"notes\"\nselect item 2 of line 2 of field \"notes\""); no_error(&rt);
+    assert_eq!(rt.w.borrow().selection.map(|s| (s.1, s.2)), Some((9, 11)));
+    rt.exec(r#"select char 1 to 2 of item 3 of line 2 of field "notes"; put the selectedText into field "search";"#); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "ff");
+    rt.exec(r#"select after word 1 of line 1 of field "notes";"#); no_error(&rt);
+    assert_eq!(rt.w.borrow().selection.map(|s| (s.1, s.2)), Some((5, 5)));
+    // exit to HyperCard ends the calling handlers too, quietly.
+    let card = rt.w.borrow().current_card();
+    rt.set_script(card, "on outer\n  inner\n  put \"not reached\" into field \"search\"\nend outer\non inner\n  put \"inner\" into field \"search\"\n  exit to HyperCard\nend inner");
+    assert_eq!(rt.script_error(card), None);
+    rt.send(card, "outer"); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "inner");
+}
+
+#[test]
+fn other_stacks_by_name() {
+    let rt = Rt::with_home(demo::address_book(), Some(demo::home()));
+    // This stack by name, and another stack, loaded read-only.
+    rt.exec(r#"put the name of stack "Address Book" into field "search";"#); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "Address Book");
+    rt.exec(r#"put the script of stack "Self Test" into field "notes";"#); no_error(&rt);
+    assert!(field(&rt, "notes").contains("on runAll"));
+    // send … to stack "x": its handlers run, then Home.
+    rt.exec(r#"put stackTwice(4) into x; send "help" to stack "Self Test";"#);
+    assert!(rt.w.borrow().last_error.is_some(), "a function in another stack is not on this stack's path");
+    rt.exec(r#"send "help" to stack "Self Test";"#); no_error(&rt);
+    assert_eq!(rt.w.borrow().dialog.as_deref(), Some("Messages travel: part, card, background, stack, Home."));
+    rt.reply("OK");
+    rt.exec(r#"put there is a stack "Self Test" into field "search";"#); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "true");
+    rt.exec(r#"put the name of stack "Nowhere" into x;"#);
+    assert!(rt.w.borrow().last_error.as_deref().unwrap_or("").contains("no such stack"));
+}
+
+#[test]
+fn visual_effect_idle_and_autoselect() {
+    let rt = Rt::new(demo::address_book());
+    rt.exec("visual effect zoom in very slow\ngo next"); no_error(&rt);
+    assert_eq!(rt.w.borrow().effect.as_deref(), Some("zoom-in"));
+    rt.exec("visual barn door open to black; go next with dissolve;"); no_error(&rt);
+    assert_eq!(rt.w.borrow().effect.as_deref(), Some("dissolve"), "go … with wins over visual");
+    rt.exec("visual effect wipe left"); no_error(&rt);
+    rt.exec("go prev"); no_error(&rt);
+    assert_eq!(rt.w.borrow().effect.as_deref(), Some("dissolve"), "a visual effect lasts for its own run only");
+    // idle goes to the current card only when a script handles it.
+    assert!(!rt.idle());
+    let card = rt.w.borrow().current_card();
+    rt.set_script(card, "on idle\n  put \"idle\" into field \"search\"\nend idle");
+    assert!(rt.idle()); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "idle");
+    // A list field: autoSelect selects the clicked line.
+    let notes = part(&rt, Kind::Field, "notes");
+    rt.exec("put \"red\" & return & \"green\" & return & \"blue\" into field \"notes\"; set the locked of field \"notes\" to true; set the autoSelect of field \"notes\" to true;"); no_error(&rt);
+    rt.set_script(notes, "on mouseUp\n  put the selectedText & \"/\" & the selectedLine into field \"search\"\nend mouseUp");
+    rt.click_field(notes, Some(6)); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "green/line 2 of field \"notes\"");
 }

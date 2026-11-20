@@ -64,9 +64,9 @@ note = "buttons; no menus"
 
 [[kw]]
 id = "cmd_exit"
-cls = "partial"
-ours = "repeat { exit repeat; }"
-note = "exit <handler>, exit repeat; no exit to hypercard"
+cls = "clean"
+ours = "repeat { exit repeat; } exit to HyperCard;"
+test = "select_nested_chunks_and_exit_to_hypercard"
 
 [[kw]]
 id = "cmd_find"
@@ -120,9 +120,9 @@ ours = "put 5 * 4 into x; put \"a\" before x; put \"!\" after field \"notes\"; p
 
 [[kw]]
 id = "cmd_select"
-cls = "partial"
-ours = "select line 1 of field \"notes\"; select before text of field \"notes\"; select word 1 to 2 of field \"notes\"; select empty;"
-note = "one chunk level (not item 2 of line 3)"
+cls = "clean"
+ours = "select line 1 of field \"notes\"; select before text of field \"notes\"; select word 1 to 2 of field \"notes\"; select char 1 of word 2 of line 1 of field \"notes\"; select empty;"
+test = "select_nested_chunks_and_exit_to_hypercard"
 
 [[kw]]
 id = "cmd_send"
@@ -141,9 +141,10 @@ ours = "show button \"Hello\";"
 
 [[kw]]
 id = "cmd_sort"
-cls = "partial"
-ours = "sort cards descending by field \"name\"; sort by word 2 of field \"name\";"
-note = "cards only; not the lines of a field"
+cls = "clean"
+ours = "sort cards descending by field \"name\"; sort by word 2 of field \"name\"; sort lines of field \"notes\" descending; put \"3,1,2\" into v; sort items of v numeric by each;"
+test = "sort_lines_and_items_of_containers"
+note = "not sort marked cards / cards of a background"
 
 [[kw]]
 id = "cmd_startusing"
@@ -153,9 +154,10 @@ test = "libraries_and_other_stacks"
 
 [[kw]]
 id = "cmd_visual"
-cls = "renamed"
-ours = "go next with wipe left;"
-note = "go … with <effect> instead of a separate visual effect command"
+cls = "clean"
+ours = "visual effect barn door open slowly; go next; go next with wipe left;"
+test = "visual_effect_idle_and_autoselect"
+note = "also go … with <effect>"
 
 [[kw]]
 id = "cmd_wait"
@@ -234,9 +236,9 @@ ours = "put the commandKey & the shiftKey & the optionKey into k;"
 
 [[kw]]
 id = "fn_result"
-cls = "partial"
-ours = "go to card \"nope\"; put the result into r; find \"zzz\"; put the result into r;"
-note = "set by go and find only"
+cls = "clean"
+ours = "go to card \"nope\"; put the result into r; find \"zzz\"; put the result into r; ask \"x\"; put the result into r;"
+note = "set by go, find, answer/ask (Cancel), start using, url, file commands"
 
 [[kw]]
 id = "fn_tool"
@@ -388,9 +390,10 @@ ours = "put field \"name\" into n; put field 1 into m;"
 
 [[kw]]
 id = "obj_stack"
-cls = "partial"
-ours = "put the name of stack & the name of this stack into n; send \"help\" to stack;"
-note = "this stack, and other stacks for go / start using; no references into other stacks (card 1 of stack \"x\")"
+cls = "clean"
+ours = "put the name of stack & the name of this stack into n; put the script of stack \"Self Test\" into s; put there is a stack \"Pillars\" into t;"
+test = "other_stacks_by_name"
+note = "another stack's properties are read from its file; changes to them are not saved"
 
 [[kw]]
 id = "obj_this"
@@ -532,9 +535,9 @@ cls = "na"
 
 [[kw]]
 id = "msg_idle"
-cls = "renamed"
-note = "frame, sent on cards with a canvas"
-test = "breakout_runs"
+cls = "clean"
+test = "visual_effect_idle_and_autoselect"
+note = "about ten times a second, to the current card, when a script on its path handles it; frame (every display frame, cards with a canvas) for animation"
 
 [[kw]]
 id = "msg_mousedown"
@@ -711,7 +714,9 @@ ours = "put the sharedText of field \"status\" into s;"
 
 [[kw]]
 id = "prop_autoselect"
-cls = "missing"
+cls = "clean"
+ours = "set the autoSelect of field \"notes\" to true;"
+test = "visual_effect_idle_and_autoselect"
 
 [[kw]]
 id = "prop_autohilite"

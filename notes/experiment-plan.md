@@ -1066,3 +1066,54 @@ wait:
     the answer;
   - `ask` handles both Cancel and OK;
   - no console errors.
+
+### More HyperTalk: sort, select, exit, other stacks, visual, idle, autoSelect (2026-11-20)
+
+**New forms:**
+- **`sort [lines|items of] <container> [ascending|descending] [text|numeric|dateTime] [by <expr of each>]`:**
+  - Works on fields, variables, or any container `put` can write.
+  - Stable, so sorting twice makes a sort by two keys.
+  - Numbers come first in `numeric` order, and anything that isn't a number
+    goes after them.
+  - Implementation: the translator rewrites the statement into an inline loop
+    that computes the keys, then a `put`. It is not a closure: Rhai hashes a
+    closure's body, and custom-syntax state can't be hashed.
+- **`select item 2 of line 3 of field "x"`:** chunks nest to any depth, with
+  `before`/`after` and `to` ranges at every level.
+- **`exit to HyperCard`:** ends every handler of the run, without an error.
+- **`stack "name"` as a reference:**
+  - covers `the script of stack "x"`, `send "m" to stack "x"` (its script,
+    then Home) and `there is a stack "x"`;
+  - the other stack is loaded once from its file, read-only, with ids from
+    VISIT0;
+  - a paused run that is rerun loads it again through the tape.
+- **`visual [effect] <name> [direction] [speed] [to black…]`:**
+  - sets the effect for the next `go` in the same run;
+  - `go … with` still wins;
+  - the player gained CSS for wipe up/down, scroll and push, zoom, barn door,
+    iris close, venetian blinds, checkerboard, shrink and stretch.
+- **`idle`:** goes to the current card about ten times a second in browse
+  mode, but only when a script on its path mentions idle, so other stacks pay
+  nothing.
+- **`autoSelect`:** in a locked field with `autoSelect`, a click selects the
+  clicked line, so `the selectedText` and `the selectedLine` give it.
+
+**Checks:**
+- **path.rs:** 41 tests pass.
+- **Keywords:** 129 of 149 clean (87%), 93% excluding the n/a rows.
+- **Web player, in headless Chromium:**
+  - a list-field click selects "green" and its `mouseUp` reads it;
+  - `visual effect zoom in; go next` plays the zoom;
+  - the Self Test passes 29 of 29;
+  - the wait and dialog checks still pass.
+
+**Still not clean:**
+- `click`/`drag` (no drag);
+- `create` (no stacks or menus);
+- `find … of marked cards`;
+- the environment functions (windows, menus, disk space);
+- operator precedence beyond `&` / `and` / `not`;
+- icons by number;
+- the painting user level;
+- `moveWindow`;
+- `quit`.

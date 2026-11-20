@@ -1,6 +1,6 @@
 //! Script engine: stock Rhai plus English-shaped commands, and the message path.
 //! Path: part -> card -> background -> stack -> built-in. Commands are messages first.
-use crate::model::{canon_prop, GoStack, Kind, Obj, OpenFile, Shape, SoundCmd, StackFile, Value, World, HOME, LIB0};
+use crate::model::{canon_prop, GoStack, Kind, Obj, OpenFile, Shape, SoundCmd, StackFile, Value, World, HOME, LIB0, VISIT0};
 use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString, Position, Scope, AST};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -46,7 +46,9 @@ impl RefSt {
     fn step(&mut self, look: &str) -> Option<ImmutableString> {
         match self.phase {
             0 => match look {
-                "me" | "target" | "stack" => { self.kind = look.into(); self.phase = 9; Some(look.into()) }
+                "me" | "target" => { self.kind = look.into(); self.phase = 9; Some(look.into()) }
+                // `stack` alone is this stack; `stack "name"` another one.
+                "stack" => { self.kind = look.into(); self.phase = 2; Some(look.into()) }
                 "this" => { self.phase = 1; Some("this".into()) }
                 // `the target`, as HyperTalk writes it
                 "the" => { self.phase = 7; Some("the".into()) }
@@ -174,6 +176,9 @@ fn settle(w: &W, live: &L) {
 }
 
 const PAUSED: &str = "\u{2}paused";
+/// `exit to HyperCard`: not catchable either; the run ends quietly.
+const EXIT_ALL: &str = "\u{3}exit";
+fn is_exit_all(e: &EvalAltResult) -> bool { matches!(e, EvalAltResult::ErrorTerminated(v, _) if v.clone().into_string().map(|s| s == EXIT_ALL).unwrap_or(false)) }
 /// Not catchable by `try`: unwinds the whole run.
 fn pause(live: &L, why: Waiting) -> Box<EvalAltResult> {
     live.borrow_mut().waiting = Some(why);
@@ -248,7 +253,7 @@ struct Snap {
     mark: usize, txn: u64, next_id: u32, current_card: u32, log_len: usize, result: String, item_delim: String,
     timers: Vec<(f64, u32, String)>, push_list: Vec<u32>, selection: Option<(u32, usize, usize)>, focused: Option<u32>,
     user_level: i64, open_files: HashMap<String, OpenFile>, effect: Option<String>, effect_seq: u64, sound: Option<String>,
-    draw: HashMap<u32, Vec<Shape>>, mouse_click: bool, click_loc: (f64, f64), libs: Vec<Obj>, globals: HashMap<String, Dynamic>, seed: u64,
+    draw: HashMap<u32, Vec<Shape>>, mouse_click: bool, click_loc: (f64, f64), libs: Vec<Obj>, visited: Vec<Obj>, globals: HashMap<String, Dynamic>, seed: u64,
 }
 
 struct Paused { entry: Entry, snap: Snap, tape: Vec<(String, Dynamic)> }
@@ -292,6 +297,10 @@ fn dispatch_ex(engine: &Engine, w: &W, live: &L, start: u32, msg: &str, args: Ve
     while let Some(id) = cur {
         hops += 1;
         if hops > 16 { break; }
+        if id >= VISIT0 && !live.borrow().asts.contains_key(&id) && !live.borrow().errors.contains_key(&id) {
+            let src = w.borrow().obj(id).map(|o| o.script.clone()).unwrap_or_default();
+            compile_into(engine, live, id, &src);
+        }
         let ast = live.borrow().asts.get(&id).cloned();
         let parent = w.borrow().next_on_path(id);
         if let Some(ast) = ast {
@@ -361,7 +370,10 @@ fn resolve(w: &W, live: &L, kind: &str, key: Option<&Dynamic>) -> R<u32> {
                 }.ok_or_else(|| err(&format!("no background \"{k}\"")))
             }
         },
-        "stack" => Ok(w.borrow().stack_id()),
+        "stack" => match key {
+            None => Ok(w.borrow().stack_id()),
+            Some(k) => other_stack(w, &k.to_string()),
+        },
         "part" => {
             let key = from_dyn(key.ok_or_else(|| err("part what? write part 3 or part \"name\""))?);
             let wb = w.borrow();
@@ -1265,6 +1277,28 @@ fn build_engine(w: &W, live: &L) -> Engine {
         });
     }
 
+    // visual [effect] <name> [direction] [very slow|slow|fast|very fast] [to black|white|gray|inverse|card]:
+    // the effect for the next `go` in this handler run.
+    { let w = w.clone();
+      e.register_custom_syntax_with_state_raw("visual",
+        |syms: &[ImmutableString], look: &str, state: &mut Dynamic| {
+            if syms.len() == 1 { *state = Dynamic::from(String::new()); }
+            if syms.len() == 1 && look == "effect" { return Ok(Some("effect".into())); }
+            // Words until the statement ends; `in` (zoom in) is a keyword, so words are kept in the state.
+            if !look.chars().next().is_some_and(|c| c.is_alphabetic()) { return Ok(None); }
+            *state = Dynamic::from(format!("{} {}", state, look.to_lowercase()));
+            Ok(Some(if look == "in" { "in".into() } else { "$ident$".into() }))
+        }, false,
+        move |_, _, state| {
+            let words: Vec<String> = state.to_string().split_whitespace().map(String::from).collect();
+            let cut = words.iter().position(|w| w == "to").unwrap_or(words.len());
+            let name: Vec<&str> = words[..cut].iter().map(|s| s.as_str()).filter(|w| !matches!(*w, "very" | "slow" | "slowly" | "fast")).collect();
+            if name.is_empty() { return Err(err("visual effect what? e.g. visual effect dissolve")); }
+            w.borrow_mut().visual = Some(name.join("-"));
+            Ok(Dynamic::UNIT)
+        });
+    }
+
     // Drawing. The target canvas is the innermost `with canvas` block, else `me` if it is a canvas,
     // else the first canvas on the current card. Coordinates are canvas-relative.
     fn f(d: &Dynamic) -> f64 { d.as_float().ok().or_else(|| d.as_int().ok().map(|i| i as f64)).or_else(|| d.clone().into_string().ok().and_then(|s| s.trim().parse().ok())).unwrap_or(0.0) }
@@ -1373,7 +1407,10 @@ fn build_engine(w: &W, live: &L) -> Engine {
             let from = me(&w, &live);
             let name = w.borrow().get(target, "name").text();
             if !dispatch(ctx.engine(), &w, &live, from, "go", vec![name.into()])? {
+                // `go … with <effect>`, else the effect a `visual effect` command set earlier in this run.
+                let pending = w.borrow_mut().visual.take();
                 if !st.effect.is_empty() { w.borrow_mut().set_effect(&st.effect.join("-")); }
+                else if let Some(v) = pending { w.borrow_mut().set_effect(&v); }
                 navigate(ctx.engine(), &w, &live, target)?;
             }
             Ok(Dynamic::UNIT)
@@ -1627,10 +1664,11 @@ fn build_engine(w: &W, live: &L) -> Engine {
         });
     }
 
-    // select [before|after] <chunk> <n> [to <m>] of field <name> | select [before|after] text of field <name> | select empty
+    // select [before|after] <chunk> <n> [to <m>] [of <chunk> <n> …] of field <name>
+    // select [before|after] text of field <name>   |   select empty
     { let (w, live) = (w.clone(), live.clone());
       #[derive(Clone, Default)]
-      struct SelSt { pos: String, chunk: String, range: bool, phase: u8 }
+      struct SelSt { pos: String, chunk: String, phase: u8, levels: Vec<(String, bool)> }
       e.register_custom_syntax_with_state_raw("select",
         |syms: &[ImmutableString], look: &str, state: &mut Dynamic| {
             let mut st = if syms.len() == 1 { SelSt::default() } else { state.clone_cast::<SelSt>() };
@@ -1638,9 +1676,11 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 0 => if look == "empty" { st.phase = 9; Some("empty".into()) }
                      else if matches!(look, "before" | "after") && st.pos.is_empty() { st.pos = look.into(); Some(look.into()) }
                      else if look == "text" { st.chunk = "text".into(); st.phase = 3; Some("text".into()) }
-                     else { st.chunk = look.into(); st.phase = 1; Some(look.into()) },
+                     else { st.chunk = look.into(); st.levels.push((look.into(), false)); st.phase = 1; Some(look.into()) },
                 1 => { st.phase = 2; Some("$expr$".into()) }
-                2 => if look == "to" && !st.range { st.range = true; st.phase = 1; Some("to".into()) } else { st.phase = 4; Some("of".into()) },
+                2 => if look == "to" && !st.levels.last().map(|l| l.1).unwrap_or(true) { if let Some(l) = st.levels.last_mut() { l.1 = true; } st.phase = 1; Some("to".into()) } else { st.phase = 6; Some("of".into()) },
+                // after `of`: another chunk (item 2 of line 3 of …) or the field
+                6 => if matches!(look, "line" | "item" | "word" | "char" | "character") { st.levels.push((look.into(), false)); st.phase = 1; Some(look.into()) } else { st.phase = 5; Some("field".into()) },
                 3 => { st.phase = 4; Some("of".into()) }
                 4 => { st.phase = 5; Some("field".into()) }
                 5 => { st.phase = 9; Some(slot(look)) }
@@ -1656,11 +1696,25 @@ fn build_engine(w: &W, live: &L) -> Engine {
             let f = resolve(&w, &live, "field", Some(&field_key))?;
             let text = w.borrow().get(f, "text").text();
             let (a, b) = if st.chunk == "text" { (0, text.chars().count()) } else {
-                let kind = match st.chunk.as_str() { "character" => "char", k => k };
-                if !CHUNKS.contains(&kind) { return Err(err(&format!("select what? use select line 2 of field …, not {}", st.chunk))); }
-                let n = index(&ctx.eval_expression_tree(&inputs[0])?)?;
-                let m = if st.range { index(&ctx.eval_expression_tree(&inputs[1])?)? } else { n };
-                (chunk_span(kind, n, &text).0, chunk_span(kind, m, &text).1)
+                // Inputs come innermost first (item 2 of line 3); apply them outermost first, each within the last.
+                let mut at = 0;
+                let mut bounds = vec![];
+                for (chunk, range) in &st.levels {
+                    let kind = match chunk.as_str() { "character" => "char", k => k };
+                    if !CHUNKS.contains(&kind) { return Err(err(&format!("select what? use select line 2 of field …, not {chunk}"))); }
+                    let n = index(&ctx.eval_expression_tree(&inputs[at])?)?;
+                    let m = if *range { at += 1; index(&ctx.eval_expression_tree(&inputs[at])?)? } else { n };
+                    at += 1;
+                    bounds.push((kind, n, m));
+                }
+                let chars: Vec<char> = text.chars().collect();
+                let (mut a, mut b) = (0, chars.len());
+                for (kind, n, m) in bounds.into_iter().rev() {
+                    let inner: String = chars[a..b].iter().collect();
+                    let (x, y) = (chunk_span(kind, n, &inner).0, chunk_span(kind, m, &inner).1);
+                    (a, b) = (a + x, a + y.max(x));
+                }
+                (a, b)
             };
             let r = match st.pos.as_str() { "before" => (f, a, a), "after" => (f, b, b), _ => (f, a, b) };
             let mut wb = w.borrow_mut();
@@ -2068,10 +2122,19 @@ fn build_engine(w: &W, live: &L) -> Engine {
     e.register_custom_syntax(["Break"], false, |_, _| Err(Box::new(EvalAltResult::LoopBreak(true, Dynamic::UNIT, Position::NONE)))).unwrap();
     e.register_custom_syntax(["Continue"], false, |_, _| Err(Box::new(EvalAltResult::LoopBreak(false, Dynamic::UNIT, Position::NONE)))).unwrap();
     e.register_custom_syntax(["next", "repeat"], false, |_, _| Err(Box::new(EvalAltResult::LoopBreak(false, Dynamic::UNIT, Position::NONE)))).unwrap();
+    // exit repeat | exit <handler> | exit to HyperCard (ends every handler of the run)
     e.register_custom_syntax_with_state_raw("exit",
-        |syms: &[ImmutableString], look: &str, state: &mut Dynamic| Ok(if syms.len() == 1 { *state = Dynamic::from(look == "repeat"); Some(if look == "repeat" { "repeat".into() } else { "$ident$".into() }) } else { None }),
+        |syms: &[ImmutableString], look: &str, state: &mut Dynamic| Ok(match syms.len() {
+            1 => { *state = Dynamic::from(look.to_string()); Some(match look { "repeat" => "repeat".into(), "to" => "to".into(), _ => "$ident$".into() }) }
+            2 if syms[1] == "to" => Some("$ident$".into()),
+            _ => None,
+        }),
         false,
-        |_, _, state| if state.as_bool().unwrap_or(false) { Err(Box::new(EvalAltResult::LoopBreak(true, Dynamic::UNIT, Position::NONE))) } else { Err(Box::new(EvalAltResult::Return(Dynamic::UNIT, Position::NONE))) });
+        |_, _, state| match state.to_string().as_str() {
+            "repeat" => Err(Box::new(EvalAltResult::LoopBreak(true, Dynamic::UNIT, Position::NONE))),
+            "to" => Err(Box::new(EvalAltResult::ErrorTerminated(Dynamic::from(EXIT_ALL), Position::NONE))),
+            _ => Err(Box::new(EvalAltResult::Return(Dynamic::UNIT, Position::NONE))),
+        });
 
     // repeat [forever] { } | repeat <n> [times] { } | repeat while|until <cond> { } | repeat with <v> = <a> [down] to <b> { }
     // `break` and `continue` (exit repeat / next repeat) work inside.
@@ -2184,7 +2247,7 @@ impl Rt {
         self.w.borrow_mut().auto_depth += 1;
         let r = dispatch(&self.engine, &self.w, &self.live, card, "frame", vec![]);
         self.w.borrow_mut().auto_depth -= 1;
-        if let Err(e) = r { self.fail(card, e); }
+        match r { Err(e) if is_exit_all(&e) => self.live.borrow_mut().frames.clear(), Err(e) => self.fail(card, e), Ok(_) => {} }
         true
     }
 
@@ -2252,6 +2315,47 @@ impl Rt {
         if self.waiting() == Some(Waiting::Dialog) { self.resume(Some(Dynamic::UNIT)); }
     }
 
+    /// `idle`: the player calls this a few times a second in browse mode. The current card gets `idle`
+    /// when a script on its path handles it (so stacks without one cost nothing).
+    pub fn idle(&self) -> bool {
+        if self.is_paused() { return false; }
+        let card = self.w.borrow().current_card();
+        let wants = {
+            let wb = self.w.borrow();
+            let mut cur = Some(card);
+            let mut found = false;
+            for _ in 0..16 {
+                let Some(id) = cur else { break };
+                if wb.obj(id).map(|o| o.script.to_lowercase().contains("idle")).unwrap_or(false) { found = true; break; }
+                cur = wb.next_on_path(id);
+            }
+            found
+        };
+        wants && self.send_with(card, "idle", vec![])
+    }
+
+    /// A click in a locked field at a character offset: for clickText / clickLine / clickChunk, and with
+    /// autoSelect (a list field) the clicked line is selected. Then mouseUp goes to the field.
+    pub fn click_field(&self, f: u32, at: Option<usize>) -> bool {
+        if self.is_paused() { return false; }
+        {
+            let mut wb = self.w.borrow_mut();
+            wb.mouse_click = true;
+            if let Some(at) = at {
+                wb.click_text_at = Some((f, at));
+                if wb.get(f, "autoSelect").truthy() {
+                    let text = wb.get(f, "text").text();
+                    let chars: Vec<char> = text.chars().collect();
+                    let at = at.min(chars.len());
+                    let a = chars[..at].iter().rposition(|c| *c == '\n').map(|i| i + 1).unwrap_or(0);
+                    let b = chars[at..].iter().position(|c| *c == '\n').map(|i| at + i).unwrap_or(chars.len());
+                    if a < b { wb.selection = Some((f, a, b)); wb.select_request = Some((f, a, b)); }
+                }
+            }
+        }
+        self.send(f, "mouseUp")
+    }
+
     /// Whether a script is paused (the stack is modal until it finishes).
     pub fn is_paused(&self) -> bool { self.paused.borrow().is_some() }
 
@@ -2311,7 +2415,7 @@ impl Rt {
 
     fn start(&self, entry: Entry, tape: Vec<(String, Dynamic)>, resume: Option<Dynamic>) -> bool {
         let snap = self.snapshot();
-        { let mut wb = self.w.borrow_mut(); wb.begin(); wb.last_error = None; wb.journal_floor = snap.mark; wb.floor_merges.clear(); }
+        { let mut wb = self.w.borrow_mut(); wb.begin(); wb.last_error = None; wb.journal_floor = snap.mark; wb.floor_merges.clear(); wb.visual = None; }
         let tape_rc = self.live.borrow().tape.clone();
         *tape_rc.borrow_mut() = Tape { on: true, replaying: !tape.is_empty(), entries: tape, resume, ..Default::default() };
         let real_fs = self.w.borrow().fs.clone();
@@ -2330,7 +2434,7 @@ impl Rt {
             }
             r => {
                 self.live.borrow_mut().waiting = None;
-                let h = match r { Ok(h) => h, Err(e) => { let obj = match &entry { Entry::Send { obj, .. } => *obj, Entry::Exec(_) => self.w.borrow().current_card() }; self.fail(obj, e); false } };
+                let h = match r { Ok(h) => h, Err(e) if is_exit_all(&e) => { self.live.borrow_mut().frames.clear(); true } Err(e) => { let obj = match &entry { Entry::Send { obj, .. } => *obj, Entry::Exec(_) => self.w.borrow().current_card() }; self.fail(obj, e); false } };
                 self.run_later();
                 h
             }
@@ -2385,7 +2489,7 @@ impl Rt {
             log_len: wb.log.len(), result: wb.result.clone(), item_delim: wb.item_delim.clone(), timers: wb.timers.clone(),
             push_list: wb.push_list.clone(), selection: wb.selection, focused: wb.focused, user_level: wb.user_level,
             open_files: wb.open_files.clone(), effect: wb.effect.clone(), effect_seq: wb.effect_seq, sound: wb.sound.clone(),
-            draw: wb.draw.clone(), mouse_click: wb.mouse_click, click_loc: wb.click_loc, libs: wb.libs.clone(),
+            draw: wb.draw.clone(), mouse_click: wb.mouse_click, click_loc: wb.click_loc, libs: wb.libs.clone(), visited: wb.visited.clone(),
             globals: self.live.borrow().globals.clone(), seed: rand_seed(),
         }
     }
@@ -2398,11 +2502,11 @@ impl Rt {
             wb.log.truncate(s.log_len); wb.result = s.result; wb.item_delim = s.item_delim; wb.timers = s.timers;
             wb.push_list = s.push_list; wb.selection = s.selection; wb.focused = s.focused; wb.user_level = s.user_level;
             wb.open_files = s.open_files; wb.effect = s.effect; wb.effect_seq = s.effect_seq; wb.sound = s.sound;
-            wb.draw = s.draw; wb.mouse_click = s.mouse_click; wb.click_loc = s.click_loc; wb.libs = s.libs;
+            wb.draw = s.draw; wb.mouse_click = s.mouse_click; wb.click_loc = s.click_loc; wb.libs = s.libs; wb.visited = s.visited;
             wb.dialog = None; wb.dialog_buttons.clear(); wb.dialog_ask = None; wb.dialog_file = None;
             ids
         };
-        self.live.borrow_mut().globals = s.globals;
+        { let mut lb = self.live.borrow_mut(); lb.globals = s.globals; lb.asts.retain(|k, _| *k < VISIT0); lb.errors.retain(|k, _| *k < VISIT0); }
         set_rand_seed(s.seed);
         for id in ids { self.compile(id); }
     }
@@ -2673,6 +2777,8 @@ fn register_vocabulary(e: &mut Engine, live: &L) {
     e.register_fn("^", |a: i64, b: FLOAT| (a as FLOAT).powf(b));
     e.register_fn("^", |a: FLOAT, b: i64| a.powf(b as FLOAT));
     // Functions.
+    e.register_fn("__sortParts", |text: Dynamic, kind: &str| sort_parts(&text.to_string(), kind));
+    e.register_fn("__sortBy", sort_by_keys);
     e.register_fn("random", |n: i64| -> i64 { if n < 1 { 0 } else { 1 + (rand_u64() % n as u64) as i64 } });
     e.register_fn("length", |s: Dynamic| s.to_string().chars().count() as i64);
     e.register_fn("offset", |needle: &str, hay: &str| hay.to_lowercase().find(&needle.to_lowercase()).map(|b| hay[..b].chars().count() as i64 + 1).unwrap_or(0));
@@ -2929,6 +3035,31 @@ fn format_when(secs: i64, fmt: &str) -> Option<String> {
 }
 
 /// Compile `src` as the script of `id`, the same way Rt::compile does.
+/// A stack by name: this one, a library in use, or another stack (loaded once from its file, read-only).
+fn other_stack(w: &W, name: &str) -> R<u32> {
+    let n = name.trim().trim_end_matches(".stack");
+    let same = |o: &Obj| o.name.eq_ignore_ascii_case(n);
+    {
+        let wb = w.borrow();
+        if wb.file.name.eq_ignore_ascii_case(n) || wb.obj(wb.stack_id()).map(same).unwrap_or(false) { return Ok(wb.stack_id()); }
+        if let Some(i) = wb.libs.iter().position(same) { return Ok(LIB0 + i as u32); }
+        if let Some(i) = wb.visited.iter().position(same) { return Ok(VISIT0 + i as u32); }
+    }
+    let path = w.borrow().find_stack(n).ok_or_else(|| err(&format!("no such stack \"{n}\"")))?;
+    let file = match path.strip_prefix("demo:") {
+        Some(d) => crate::demo::by_name(d).ok_or_else(|| err("no such demo"))?,
+        None => { let bytes = w.borrow().fs.borrow().read_bytes(&path).map_err(|e| err(&e))?; StackFile::from_bytes(&bytes).map_err(|e| err(&e))? }
+    };
+    let mut obj = file.objs.iter().find(|o| o.kind == Kind::Stack).cloned().ok_or_else(|| err("that file has no stack"))?;
+    if obj.name.is_empty() { obj.name = file.name.clone(); }
+    let mut wb = w.borrow_mut();
+    obj.id = VISIT0 + wb.visited.len() as u32;
+    obj.parent = None;
+    let id = obj.id;
+    wb.visited.push(obj);
+    Ok(id)
+}
+
 fn compile_into(engine: &Engine, live: &L, id: u32, src: &str) {
     let mut lb = live.borrow_mut();
     if src.trim().is_empty() { lb.asts.remove(&id); lb.errors.remove(&id); return; }
@@ -3093,7 +3224,13 @@ pub fn hypertalk_blocks(src: &str) -> String {
             if !t.is_empty() { last_single_if = false; }
             // A brace-style line holding one statement can also be a user command: `check "x", true;`
             let one = t.strip_suffix(';').filter(|b| !b.contains(';') && !b.contains('{') && !b.contains('}'));
-            let line = match one.and_then(user_command) { Some(c) if !was_continued => c, _ => t.clone() };
+            let line = match one.and_then(rewrite_statement) {
+                Some(c) if !was_continued => c,
+                // Several statements on one line: a `sort … of <container>` among them is still rewritten.
+                _ if !was_continued && t.to_lowercase().contains("sort ") && !t.contains('{') && !t.contains('}') =>
+                    split_statements(&t).into_iter().map(|st| sort_container(&st).unwrap_or_else(|| format!("{};", st.trim()))).collect::<Vec<_>>().join(" "),
+                _ => t.clone(),
+            };
             push(&mut out, line);
             continue;
         }
@@ -3160,7 +3297,7 @@ pub fn hypertalk_blocks(src: &str) -> String {
                 if rest.is_empty() { "repeat {".to_string() } else { format!("repeat {rest} {{") }
             }
             // The rest of a continued line (`¬`) is never a command of its own.
-            _ => match (!was_continued).then(|| user_command(&t)).flatten() { Some(c) => c, None => stmt(&t) },
+            _ => match (!was_continued).then(|| rewrite_statement(&t)).flatten() { Some(c) => c, None => stmt(&t) },
         };
         push(&mut out, line);
     }
@@ -3191,7 +3328,7 @@ const KNOWN_STATEMENT_WORDS: &[&str] = &[
     "let", "const", "if", "else", "while", "loop", "for", "do", "return", "break", "continue", "fn", "switch", "throw", "try", "catch",
     "import", "export", "private", "print", "debug", "true", "false", "this",
     // this language
-    "on", "function", "end", "pass", "exit", "next", "repeat", "global", "put", "get", "set", "go", "answer", "ask", "wait", "find", "beep",
+    "on", "function", "end", "pass", "exit", "next", "repeat", "global", "put", "get", "set", "go", "answer", "ask", "wait", "visual", "find", "beep",
     "send", "new", "hide", "show", "enable", "disable", "mark", "unmark", "play", "lock", "unlock", "with", "add", "subtract",
     "multiply", "divide", "do", "sort", "push", "pop", "edit", "select", "click", "type", "create", "convert", "file", "open", "close",
     "read", "write", "delete", "rename", "load", "url", "start", "stop", "there", "the", "me", "it", "target", "field", "button",
@@ -3199,6 +3336,97 @@ const KNOWN_STATEMENT_WORDS: &[&str] = &[
     "seventh", "eighth", "ninth", "tenth", "last", "middle", "any", "empty", "space", "tab", "quote", "pi", "zero", "one", "two",
     "three", "four", "five", "six", "seven", "eight", "nine", "ten", "up", "down", "lineFeed", "newline", "comma", "eof",
 ];
+
+/// Statements rewritten before compiling: sorting a container, and user commands.
+fn rewrite_statement(line: &str) -> Option<String> { sort_container(line).or_else(|| user_command(line)) }
+
+/// Split a line at the `;` outside quotes and brackets (empty pieces dropped).
+fn split_statements(t: &str) -> Vec<String> {
+    let (mut out, mut cur, mut depth, mut quote) = (vec![], String::new(), 0i32, false);
+    for c in t.chars() {
+        if quote { cur.push(c); if c == '"' { quote = false; } continue; }
+        match c {
+            '"' => { quote = true; cur.push(c); }
+            '(' | '[' => { depth += 1; cur.push(c); }
+            ')' | ']' => { depth -= 1; cur.push(c); }
+            ';' if depth == 0 => { if !cur.trim().is_empty() { out.push(std::mem::take(&mut cur)); } else { cur.clear(); } }
+            c => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() { out.push(cur); }
+    out
+}
+
+/// Words at the top level of a statement (not inside quotes or brackets), with their byte ranges.
+fn top_words(t: &str) -> Vec<(usize, usize)> {
+    let (mut out, mut depth, mut quote, mut start) = (vec![], 0i32, false, None::<usize>);
+    for (i, c) in t.char_indices() {
+        if quote { if c == '"' { quote = false; } continue; }
+        match c {
+            '"' => { quote = true; start.get_or_insert(i); }
+            '(' | '[' | '{' => { depth += 1; start.get_or_insert(i); }
+            ')' | ']' | '}' => { depth -= 1; }
+            c if c.is_whitespace() && depth == 0 => { if let Some(s) = start.take() { out.push((s, i)); } }
+            _ => { start.get_or_insert(i); }
+        }
+    }
+    if let Some(s) = start { out.push((s, t.len())); }
+    out
+}
+
+const SORT_FLAGS: &[&str] = &["ascending", "descending", "text", "numeric", "international", "datetime"];
+
+/// `sort [lines|items of] <container> [ascending|descending] [text|numeric|dateTime] [by <expr of each>]`
+/// → `{ let __p = __sortParts(<container>, "lines"); let __k = []; for each in __p { __k.push(<expr>); }
+///      put __sortBy(__p, __k, "lines", "<flags>") into <container>; }`  (all on one line; no closure, since
+/// Rhai cannot hash a closure body holding custom syntax).
+/// Sorting cards (`sort [cards] … by …`) is left to the `sort` command.
+fn sort_container(line: &str) -> Option<String> {
+    let t = line.trim().trim_end_matches(';').trim_end();
+    let words = top_words(t);
+    let w = |i: usize| words.get(i).map(|&(a, b)| t[a..b].to_lowercase()).unwrap_or_default();
+    if w(0) != "sort" { return None; }
+    let mut i = 1;
+    let mut flags = vec![];
+    while SORT_FLAGS.contains(&w(i).as_str()) { flags.push(w(i)); i += 1; }
+    let first = w(i);
+    if first.is_empty() || matches!(first.as_str(), "cards" | "the" | "by" | "marked" | "this") { return None; }
+    let kind = if matches!(first.as_str(), "lines" | "items") && w(i + 1) == "of" { i += 2; first.clone() } else { "lines".to_string() };
+    let start = words.get(i)?.0;
+    let mut j = i;
+    while j < words.len() && !SORT_FLAGS.contains(&w(j).as_str()) && w(j) != "by" { j += 1; }
+    if j == i { return None; }
+    let container = t[start..words[j - 1].1].trim();
+    while SORT_FLAGS.contains(&w(j).as_str()) { flags.push(w(j)); j += 1; }
+    let key = if w(j) == "by" { Some(t[words.get(j + 1)?.0..].trim()) } else if j < words.len() { return None } else { None };
+    let flags = flags.join(" ");
+    let key = key.unwrap_or("each");
+    Some(format!("{{ let __p = __sortParts({container}, \"{kind}\"); let __k = []; for each in __p {{ __k.push({key}); }} put __sortBy(__p, __k, \"{kind}\", \"{flags}\") into {container}; }}"))
+}
+
+/// The lines or items of a text, for sorting.
+fn sort_parts(text: &str, kind: &str) -> rhai::Array {
+    if text.is_empty() { return vec![]; }
+    if kind == "items" { text.split(delim().as_str()).map(|p| Dynamic::from(p.to_string())).collect() } else { text.lines().map(|p| Dynamic::from(p.to_string())).collect() }
+}
+
+/// Sort pieces stably by their keys and join them again.
+fn sort_by_keys(parts: rhai::Array, keys: rhai::Array, kind: &str, flags: &str) -> String {
+    use std::cmp::Ordering;
+    let mut keyed: Vec<(String, String)> = keys.into_iter().map(|k| k.to_string()).zip(parts.into_iter().map(|p| p.to_string())).collect();
+    let cmp: Box<dyn Fn(&String, &String) -> Ordering> = if flags.contains("numeric") {
+        // Numbers in order; anything that is not a number goes after them.
+        Box::new(|a, b| { let f = |s: &str| s.trim().parse::<f64>().unwrap_or(f64::INFINITY); f(a).partial_cmp(&f(b)).unwrap_or(Ordering::Equal) })
+    } else if flags.contains("datetime") {
+        Box::new(|a, b| { let f = |s: &str| parse_when(s).unwrap_or(i64::MAX); f(a).cmp(&f(b)) })
+    } else {
+        Box::new(|a, b| a.to_lowercase().cmp(&b.to_lowercase()))
+    };
+    let desc = flags.contains("descending");
+    keyed.sort_by(|a, b| if desc { cmp(&b.0, &a.0) } else { cmp(&a.0, &b.0) });
+    let sep = if kind == "items" { delim() } else { "\n".to_string() };
+    keyed.into_iter().map(|(_, p)| p).collect::<Vec<_>>().join(&sep)
+}
 
 /// `check "x", true` → `__cmd("check", ["x", true])`. None if the line is not a user command.
 fn user_command(line: &str) -> Option<String> {

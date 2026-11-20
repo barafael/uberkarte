@@ -470,6 +470,34 @@ input.t { font:inherit; padding:4px 8px; border:1px solid var(--line); border-ra
 @keyframes fx-wipe-right { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
 .fx-iris-open { animation: fx-iris .6s ease backwards; }
 @keyframes fx-iris { from { clip-path: circle(0% at 50% 50%); } to { clip-path: circle(75% at 50% 50%); } }
+.fx-wipe-up { animation: fx-wipe-up .55s ease backwards; }
+@keyframes fx-wipe-up { from { clip-path: inset(100% 0 0 0); } to { clip-path: inset(0 0 0 0); } }
+.fx-wipe-down { animation: fx-wipe-down .55s ease backwards; }
+@keyframes fx-wipe-down { from { clip-path: inset(0 0 100% 0); } to { clip-path: inset(0 0 0 0); } }
+.fx-iris-close { animation: fx-iris-close .6s ease backwards; }
+@keyframes fx-iris-close { from { clip-path: inset(0 0 0 0 round 0); opacity:.2; } to { clip-path: inset(0 0 0 0); opacity:1; } }
+.fx-scroll-left, .fx-push-left { animation: fx-scroll-left .5s ease backwards; }
+@keyframes fx-scroll-left { from { transform: translateX(100%); } }
+.fx-scroll-right, .fx-push-right { animation: fx-scroll-right .5s ease backwards; }
+@keyframes fx-scroll-right { from { transform: translateX(-100%); } }
+.fx-scroll-up, .fx-push-up { animation: fx-scroll-up .5s ease backwards; }
+@keyframes fx-scroll-up { from { transform: translateY(100%); } }
+.fx-scroll-down, .fx-push-down { animation: fx-scroll-down .5s ease backwards; }
+@keyframes fx-scroll-down { from { transform: translateY(-100%); } }
+.fx-zoom-in, .fx-zoom-open { animation: fx-zoom-open .5s ease backwards; }
+@keyframes fx-zoom-open { from { transform: scale(.1); opacity:0; } }
+.fx-zoom-out, .fx-zoom-close { animation: fx-zoom-close .5s ease backwards; }
+@keyframes fx-zoom-close { from { transform: scale(1.6); opacity:0; } }
+.fx-barn-door-open { animation: fx-barn-open .6s ease backwards; }
+@keyframes fx-barn-open { from { clip-path: inset(0 50% 0 50%); } to { clip-path: inset(0 0 0 0); } }
+.fx-barn-door-close { animation: fx-barn-close .6s ease backwards; }
+@keyframes fx-barn-close { from { clip-path: polygon(0 0, 50% 0, 50% 0, 50% 100%, 50% 100%, 0 100%); } to { clip-path: polygon(0 0, 100% 0, 100% 0, 100% 100%, 100% 100%, 0 100%); } }
+.fx-venetian-blinds { animation: fx-blinds .6s steps(6) backwards; }
+@keyframes fx-blinds { from { mask-image: repeating-linear-gradient(#000 0 2px, transparent 2px 24px); -webkit-mask-image: repeating-linear-gradient(#000 0 2px, transparent 2px 24px); } to { mask-image: repeating-linear-gradient(#000 0 24px, transparent 24px 24px); -webkit-mask-image: repeating-linear-gradient(#000 0 24px, transparent 24px 24px); } }
+.fx-checkerboard { animation: fx-dissolve .6s steps(4) backwards; }
+.fx-shrink-to-center, .fx-stretch-from-center { animation: fx-zoom-open .5s ease backwards; }
+.fx-shrink-to-top, .fx-stretch-from-top { animation: fx-wipe-down .5s ease backwards; }
+.fx-shrink-to-bottom, .fx-stretch-from-bottom { animation: fx-wipe-up .5s ease backwards; }
 @media (prefers-reduced-motion: reduce) { [class*="fx-"] { animation:none; } }
 label.t { display:inline-flex; align-items:center; font:inherit; padding:4px 10px; border:1px solid var(--line); background:#fff; border-radius:4px; cursor:pointer; }
 label.t input { display:none; }
@@ -501,6 +529,7 @@ fn App() -> Element {
         let mut raf = document::eval(RAF);
         let mut times: std::collections::VecDeque<f64> = Default::default();
         let mut cost = 0u128;
+        let mut last_idle = 0.0f64;
         while let Ok(t) = raf.recv::<f64>().await {
             // `edit the script of …` opens the editor on that object.
             if let Some(id) = rt().w.borrow_mut().edit_request.take() { edit.set(true); sel.set(Some(id)); multi.set(vec![]); tick += 1; }
@@ -515,6 +544,8 @@ fn App() -> Element {
             if let Some((f, a, b)) = rt().w.borrow_mut().select_request.take() {
                 let _ = document::eval(&format!("setTimeout(() => {{ const t = document.querySelector('textarea[data-id=\"{f}\"]'); if (t) {{ t.focus({{ preventScroll: true }}); t.setSelectionRange({a}, {b}); }} }}, 80)"));
             }
+            // About ten times a second: idle, for stacks that handle it.
+            if now - last_idle >= 100.0 { last_idle = now; if rt().idle() { handle_requests(); flush_sound(); tick += 1; } }
             // Browse mode: due `send … in` messages, then mouseStillDown / mouseWithin, then frame.
             // Nothing of that while a script is paused: the stack is modal until it finishes.
             if rt().is_paused() { times.clear(); continue; }
@@ -998,9 +1029,8 @@ fn App() -> Element {
                                             if editing || !p.locked { return; }
                                             // Where in the text the click landed: a read-only textarea still places the caret.
                                             let mut ch = document::eval(&format!("const t = document.querySelector('textarea[data-id=\"{}\"]'); dioxus.send(t ? t.selectionStart : -1)", p.id));
-                                            if let Ok(at) = ch.recv::<f64>().await { if at >= 0.0 { rt().w.borrow_mut().click_text_at = Some((p.id, at as usize)); } }
-                                            rt().w.borrow_mut().mouse_click = true;
-                                            rt().send(p.id, "mouseUp");
+                                            let at = ch.recv::<f64>().await.ok().filter(|a| *a >= 0.0).map(|a| a as usize);
+                                            rt().click_field(p.id, at);
                                             done();
                                         },
                                         onfocus: move |_| {

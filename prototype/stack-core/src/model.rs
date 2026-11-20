@@ -308,6 +308,10 @@ pub struct World {
     /// value it replaced in `floor_merges`, so `rollback` can take a paused script's changes back.
     pub journal_floor: usize,
     pub floor_merges: Vec<(usize, Option<Value>)>,
+    /// Other stacks named by scripts (ids VISIT0, VISIT0 + 1, …).
+    pub visited: Vec<Obj>,
+    /// `visual effect …`: the effect for the next `go` in this run.
+    pub visual: Option<String>,
 }
 
 /// HyperTalk property names are case-insensitive, and some have HyperTalk spellings for ours.
@@ -323,7 +327,7 @@ pub fn canon_prop(p: &str) -> String {
         "name" => "name", "id" => "id", "visible" => "visible", "style" => "style", "left" => "left", "top" => "top",
         "width" => "width", "height" => "height", "picture" => "picture", "text" => "text", "enabled" => "enabled",
         "hilite" | "highlight" => "hilite", "marked" => "marked", "rect" | "rectangle" => "rect", "loc" | "location" => "loc",
-        "owner" => "owner", "number" => "number", "script" => "script", "family" => "family", "dontsearch" => "dontSearch", "searchpaths" => "searchPaths", "autohilite" | "autoHilite" => "autoHilite", "icon" => "icon", "showpict" => "showPict", "userlevel" => "userLevel",
+        "owner" => "owner", "number" => "number", "script" => "script", "family" => "family", "dontsearch" => "dontSearch", "searchpaths" => "searchPaths", "autohilite" | "autoHilite" => "autoHilite", "autoselect" => "autoSelect", "icon" => "icon", "showpict" => "showPict", "userlevel" => "userLevel",
         _ => return p.to_string(),
     }.to_string()
 }
@@ -332,6 +336,9 @@ pub fn canon_prop(p: &str) -> String {
 pub const HOME: u32 = 0;
 /// Ids of library stacks (`start using`): LIB0, LIB0 + 1, … in the order they were started.
 pub const LIB0: u32 = 0xF000_0000;
+/// Ids of other stacks a script names (`the script of stack "x"`, `send … to stack "x"`): loaded once,
+/// read from their files, not saved. Above LIB0, so like libraries they stay out of the journal.
+pub const VISIT0: u32 = 0xF800_0000;
 
 /// A request for the player: show another stack (`go to stack …`), in this tab or a new one.
 #[derive(Clone, Debug, PartialEq)]
@@ -344,7 +351,7 @@ impl World {
         selection: None, select_request: None, focused: None, user_level: 5, tz_offset_min: 0, mouse_click: false, click_text_at: None,
         fs: std::rc::Rc::new(std::cell::RefCell::new(crate::files::default_fs())), fs_base: String::new(), open_files: Default::default(),
         dialog_file: None, url_requests: vec![], url_cache: Default::default(),
-        libs: vec![], go_stack: None, stacks_dir: String::new(), open_stacks: vec![], journal_floor: 0, floor_merges: vec![] } }
+        libs: vec![], go_stack: None, stacks_dir: String::new(), open_stacks: vec![], journal_floor: 0, floor_merges: vec![], visited: vec![], visual: None } }
 
     /// Find a stack file by name or path: the stack's own folder, then the stacks folder, then the search
     /// folders kept in Home (`the searchPaths`, one per line). `Name` also matches `Name.stack`.
@@ -392,6 +399,8 @@ impl World {
             Some(p) if matches!(o.kind, Kind::Button | Kind::Field | Kind::Canvas | Kind::Picture) && self.obj(p).map(|b| b.kind) == Some(Kind::Background) => Some(self.current_card()),
             Some(p) => Some(p),
             // After the stack: the libraries in use, in order, then Home.
+            // Another stack's script: then Home.
+            None if id >= VISIT0 => self.home.as_ref().map(|_| HOME),
             None if o.kind == Kind::Stack && id != HOME => {
                 let next_lib = if id >= LIB0 { (id - LIB0 + 1) as usize } else { 0 };
                 if next_lib < self.libs.len() { Some(LIB0 + next_lib as u32) } else if self.home.is_some() { Some(HOME) } else { None }
@@ -401,10 +410,10 @@ impl World {
     }
 
     pub fn obj(&self, id: u32) -> Option<&Obj> {
-        if id == HOME { self.home.as_ref() } else if id >= LIB0 { self.libs.get((id - LIB0) as usize) } else { self.file.objs.iter().find(|o| o.id == id) }
+        if id == HOME { self.home.as_ref() } else if id >= VISIT0 { self.visited.get((id - VISIT0) as usize) } else if id >= LIB0 { self.libs.get((id - LIB0) as usize) } else { self.file.objs.iter().find(|o| o.id == id) }
     }
     fn obj_mut(&mut self, id: u32) -> Option<&mut Obj> {
-        if id == HOME { self.home.as_mut() } else if id >= LIB0 { self.libs.get_mut((id - LIB0) as usize) } else { self.file.objs.iter_mut().find(|o| o.id == id) }
+        if id == HOME { self.home.as_mut() } else if id >= VISIT0 { self.visited.get_mut((id - VISIT0) as usize) } else if id >= LIB0 { self.libs.get_mut((id - LIB0) as usize) } else { self.file.objs.iter_mut().find(|o| o.id == id) }
     }
     pub fn stack_id(&self) -> u32 { self.file.objs.iter().find(|o| o.kind == Kind::Stack).map(|o| o.id).unwrap_or(0) }
     pub fn cards(&self) -> Vec<u32> { self.file.objs.iter().filter(|o| o.kind == Kind::Card).map(|o| o.id).collect() }
