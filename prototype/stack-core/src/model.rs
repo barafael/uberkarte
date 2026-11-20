@@ -312,6 +312,25 @@ pub struct World {
     pub visited: Vec<Obj>,
     /// `visual effect …`: the effect for the next `go` in this run.
     pub visual: Option<String>,
+    /// HyperCard's tool: "browse", "button", "field", or a paint tool ("pencil", "round rect", …).
+    pub tool: String,
+    /// Paint settings: line width for lines and shapes, and whether shapes are filled.
+    pub line_size: i64,
+    pub filled: bool,
+    /// The menu bar: built-in menus first, then those scripts create. Not saved, as in HyperCard.
+    pub menus: Vec<Menu>,
+    /// Cards visited, for `go back` (unless lockRecent).
+    pub recent: Vec<u32>,
+    pub lock_recent: bool,
+    /// The player's window: viewport size and screen position (for the screenRect, sizeWindow, moveWindow).
+    pub screen: (f64, f64),
+    pub window_loc: (f64, f64),
+    /// Requests for the player from the built-in menu items: Undo, focus the message box, quit.
+    pub undo_request: bool,
+    pub message_request: bool,
+    pub quit_request: bool,
+    /// `hide message box` / `show message box`.
+    pub message_visible: bool,
 }
 
 /// HyperTalk property names are case-insensitive, and some have HyperTalk spellings for ours.
@@ -327,7 +346,7 @@ pub fn canon_prop(p: &str) -> String {
         "name" => "name", "id" => "id", "visible" => "visible", "style" => "style", "left" => "left", "top" => "top",
         "width" => "width", "height" => "height", "picture" => "picture", "text" => "text", "enabled" => "enabled",
         "hilite" | "highlight" => "hilite", "marked" => "marked", "rect" | "rectangle" => "rect", "loc" | "location" => "loc",
-        "owner" => "owner", "number" => "number", "script" => "script", "family" => "family", "dontsearch" => "dontSearch", "searchpaths" => "searchPaths", "autohilite" | "autoHilite" => "autoHilite", "autoselect" => "autoSelect", "icon" => "icon", "showpict" => "showPict", "userlevel" => "userLevel",
+        "owner" => "owner", "number" => "number", "script" => "script", "family" => "family", "dontsearch" => "dontSearch", "searchpaths" => "searchPaths", "autohilite" | "autoHilite" => "autoHilite", "autoselect" => "autoSelect", "linesize" => "lineSize", "filled" => "filled", "lockrecent" => "lockRecent", "icon" => "icon", "showpict" => "showPict", "userlevel" => "userLevel",
         _ => return p.to_string(),
     }.to_string()
 }
@@ -340,6 +359,32 @@ pub const LIB0: u32 = 0xF000_0000;
 /// read from their files, not saved. Above LIB0, so like libraries they stay out of the journal.
 pub const VISIT0: u32 = 0xF800_0000;
 
+/// A menu in the menu bar and its items ("-" is a separator line).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Menu { pub name: String, pub items: Vec<MenuItem> }
+
+/// A menu item: its text, the message it sends instead of `doMenu` (if any), and its state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuItem { pub text: String, pub message: String, pub enabled: bool, pub checked: bool }
+
+impl MenuItem { pub fn new(text: &str) -> Self { MenuItem { text: text.into(), message: String::new(), enabled: true, checked: false } } }
+
+/// HyperCard's menus, as far as this player has them. Choosing an item sends `doMenu <item>, <menu>`;
+/// when no handler takes it, the item does its built-in action.
+pub fn default_menus() -> Vec<Menu> {
+    let m = |name: &str, items: &[&str]| Menu { name: name.into(), items: items.iter().map(|t| MenuItem::new(t)).collect() };
+    vec![
+        m("File", &["New Stack…", "-", "Quit HyperCard"]),
+        m("Edit", &["Undo", "-", "New Card", "Delete Card"]),
+        m("Go", &["Back", "First", "Prev", "Next", "Last", "-", "Find…", "Message"]),
+        m("Tools", &["Browse", "Button", "Field", "-", "Pencil", "Brush", "Eraser", "Spray", "Line", "Curve", "Rectangle", "Round Rect", "Oval", "Regular Polygon", "Polygon"]),
+    ]
+}
+
+/// The paint tools, in HyperCard's order (tool 6 to 18), and the user level they need.
+pub const TOOLS: [&str; 18] = ["browse", "button", "field", "select", "lasso", "pencil", "brush", "eraser", "line", "spray",
+    "rectangle", "round rect", "bucket", "oval", "curve", "text", "regular polygon", "polygon"];
+
 /// A request for the player: show another stack (`go to stack …`), in this tab or a new one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GoStack { pub path: String, pub card: Option<Value>, pub new_window: bool, pub effect: Option<String> }
@@ -351,7 +396,9 @@ impl World {
         selection: None, select_request: None, focused: None, user_level: 5, tz_offset_min: 0, mouse_click: false, click_text_at: None,
         fs: std::rc::Rc::new(std::cell::RefCell::new(crate::files::default_fs())), fs_base: String::new(), open_files: Default::default(),
         dialog_file: None, url_requests: vec![], url_cache: Default::default(),
-        libs: vec![], go_stack: None, stacks_dir: String::new(), open_stacks: vec![], journal_floor: 0, floor_merges: vec![], visited: vec![], visual: None } }
+        libs: vec![], go_stack: None, stacks_dir: String::new(), open_stacks: vec![], journal_floor: 0, floor_merges: vec![], visited: vec![], visual: None,
+        tool: "browse".into(), line_size: 1, filled: false, menus: default_menus(), recent: vec![], lock_recent: false,
+        screen: (0.0, 0.0), window_loc: (0.0, 0.0), undo_request: false, message_request: false, quit_request: false, message_visible: true } }
 
     /// Find a stack file by name or path: the stack's own folder, then the stacks folder, then the search
     /// folders kept in Home (`the searchPaths`, one per line). `Name` also matches `Name.stack`.

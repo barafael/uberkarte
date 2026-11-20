@@ -2,6 +2,7 @@ use stack_core::{demo, Kind, Rt, StackFile, Value, Waiting};
 
 fn part(rt: &Rt, kind: Kind, name: &str) -> u32 { rt.w.borrow().find_part(kind, &Value::Str(name.into())).unwrap() }
 fn field(rt: &Rt, name: &str) -> String { let id = part(rt, Kind::Field, name); rt.w.borrow().get(id, "text").text() }
+#[track_caller]
 fn no_error(rt: &Rt) { assert_eq!(rt.w.borrow().last_error, None); }
 
 #[test]
@@ -1114,4 +1115,114 @@ fn visual_effect_idle_and_autoselect() {
     rt.set_script(notes, "on mouseUp\n  put the selectedText & \"/\" & the selectedLine into field \"search\"\nend mouseUp");
     rt.click_field(notes, Some(6)); no_error(&rt);
     assert_eq!(field(&rt, "search"), "green/line 2 of field \"notes\"");
+}
+
+#[test]
+fn menus_and_domenu() {
+    let rt = Rt::new(demo::address_book());
+    rt.exec(r#"put the menus into field "search";"#); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "File\nEdit\nGo\nTools");
+    // Built-in items act when no handler takes doMenu.
+    rt.exec(r#"doMenu "Next";"#); no_error(&rt);
+    assert_eq!(rt.w.borrow().card_number(rt.w.borrow().current_card()), 2);
+    rt.exec(r#"doMenu "Back";"#); no_error(&rt);
+    assert_eq!(rt.w.borrow().card_number(rt.w.borrow().current_card()), 1, "Back returns to the card before");
+    // A script's own menu, with a menuMessage on one item; doMenu goes to the card first.
+    let card = rt.w.borrow().current_card();
+    rt.set_script(card, "on doMenu what, which\n  if what is \"Red\" then put \"red from \" & which into field \"search\"\n  else pass doMenu\nend doMenu\non makeBlue\n  put \"blue\" into field \"search\"\nend makeBlue");
+    rt.exec("create menu \"Colors\"\nput \"Red,Blue\" into menu \"Colors\" with menuMessages \",makeBlue\"\nput \"Green\" after menu \"Colors\""); no_error(&rt);
+    rt.exec(r#"put menu "Colors" & "|" & (there is a menu "Colors") into field "notes";"#); no_error(&rt);
+    assert_eq!(field(&rt, "notes"), "Red\nBlue\nGreen|true");
+    rt.do_menu("Red", "Colors"); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "red from Colors");
+    rt.do_menu("Blue", "Colors"); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "blue");
+    rt.exec("disable menuItem \"Green\" of menu \"Colors\"\ndelete menuItem 1 of menu \"Colors\""); no_error(&rt);
+    assert_eq!(rt.w.borrow().menus.last().unwrap().items.iter().map(|i| (i.text.as_str(), i.enabled)).collect::<Vec<_>>(), vec![("Blue", true), ("Green", false)]);
+    rt.exec("delete menu \"Colors\""); no_error(&rt);
+    rt.exec(r#"put there is a menu "Colors" into field "notes";"#); no_error(&rt);
+    assert_eq!(field(&rt, "notes"), "false");
+    rt.exec(r#"create menu "Y"; put "A,B" into menu "Y" with menuMessages "a,b""#); no_error(&rt);
+    assert_eq!(rt.w.borrow().menus.last().map(|m| m.items.len()), Some(2), "HyperTalk-style line with two statements");
+    rt.exec("create menu \"X\"\nreset menuBar\nput the menus into field \"notes\""); no_error(&rt);
+    assert_eq!(field(&rt, "notes"), "File\nEdit\nGo\nTools");
+    rt.exec(r#"doMenu "Pencil"; put the tool into field "notes";"#); no_error(&rt);
+    assert_eq!(field(&rt, "notes"), "pencil tool");
+    rt.set_script(card, "on quit\n  put \"bye\" into field \"search\"\nend quit");
+    rt.exec(r#"doMenu "Quit HyperCard";"#); no_error(&rt);
+    assert!(rt.w.borrow().quit_request);
+    assert_eq!(field(&rt, "search"), "bye", "quit is sent before quitting");
+    rt.exec(r#"doMenu "Nothing Like This";"#);
+    assert!(rt.w.borrow().last_error.as_deref().unwrap_or("").contains("no menu item"));
+}
+
+#[test]
+fn tools_drag_and_paint() {
+    let rt = Rt::new(demo::address_book());
+    let hello = part(&rt, Kind::Button, "Hello");
+    rt.set_script(hello, "on mouseDown\n  put \"down\" into field \"search\"\nend mouseDown\non mouseStillDown\n  put \".\" after field \"search\"\nend mouseStillDown\non mouseUp\n  put \" up at \" & the mouseLoc after field \"search\"\nend mouseUp");
+    let (l, t) = { let w = rt.w.borrow(); (w.get(hello, "left").int(), w.get(hello, "top").int()) };
+    rt.exec(&format!("drag from \"{},{}\" to \"{},{}\"", l + 5, t + 5, l + 25, t + 15)); no_error(&rt);
+    assert_eq!(field(&rt, "search"), format!("down........ up at {},{}", l + 25, t + 15));
+    // The button tool moves the button.
+    rt.exec(&format!("choose button tool\ndrag from \"{},{}\" to \"{},{}\" with shiftKey", l + 5, t + 5, l + 45, t + 25)); no_error(&rt);
+    assert_eq!((rt.w.borrow().get(hello, "left").int(), rt.w.borrow().get(hello, "top").int()), (l + 40, t + 20));
+    rt.exec(r#"choose tool 1; put the tool into field "search";"#); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "browse tool");
+    // Paint tools need userLevel 3; strokes go into the card's paint, and Undo takes them back.
+    rt.exec("set the userLevel to 2\nchoose pencil tool");
+    assert!(rt.w.borrow().last_error.as_deref().unwrap_or("").contains("userLevel 3"));
+    rt.exec("set the userLevel to 3\nchoose round rect tool\nset the lineSize to 3\nset the filled to true\ndrag from \"10,10\" to \"60,40\""); no_error(&rt);
+    rt.exec("choose spray can tool\nreset paint\ndrag from \"0,0\" to \"5,5\"\nchoose tool 8\nclick at \"7,7\""); no_error(&rt);
+    let card = rt.w.borrow().current_card();
+    assert_eq!(rt.w.borrow().get(card, "paint").text(), "round_rect 3 1 10,10 60,40\nspray 1 0 0,0 5,5\neraser 1 0 7,7");
+    rt.paint(&[(1.0, 1.0), (2.0, 3.0)]);
+    assert!(rt.w.borrow().get(card, "paint").text().ends_with("\neraser 1 0 1,1 2,3"));
+    rt.undo();
+    assert!(rt.w.borrow().get(card, "paint").text().ends_with("\neraser 1 0 7,7"));
+    rt.exec("choose bucket tool\ndrag from \"1,1\" to \"2,2\"\nput the result into field \"search\""); no_error(&rt);
+    assert!(field(&rt, "search").contains("does not paint"));
+}
+
+#[test]
+fn create_stack_find_marked_delete_card_and_environment() {
+    let rt = Rt::new(demo::address_book());
+    mem_fs(&rt);
+    rt.exec(r#"create stack "Notes"; put there is a stack "Notes" & "/" & the name of stack "Notes" into field "search";"#); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "true/Notes");
+    rt.exec(r#"create stack "Notes";"#);
+    assert!(rt.w.borrow().last_error.as_deref().unwrap_or("").contains("already"));
+    // find … of marked cards skips the unmarked ones.
+    rt.exec(r#"find "Hopper";"#); no_error(&rt);
+    let grace = rt.w.borrow().current_card();
+    rt.exec(r#"go first; find "Hopper" of marked cards; put the result into field "search";"#); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "not found");
+    rt.exec(r#"mark card 2; mark card 3; find "Hopper" of marked cards;"#); no_error(&rt);
+    assert_eq!(rt.w.borrow().current_card(), grace);
+    rt.exec(r#"find word "Hopper" in field "name" of marked cards; put the result into field "search";"#); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "");
+    // delete this card, then the next shows; the last card stays.
+    let n = rt.w.borrow().cards().len();
+    rt.exec("delete this card"); no_error(&rt);
+    assert_eq!(rt.w.borrow().cards().len(), n - 1);
+    assert!(rt.w.borrow().obj(grace).is_none());
+    rt.exec("set lockRecent to true\ngo next\ngo back\nset lockRecent to false");
+    rt.w.borrow_mut().screen = (1280.0, 800.0);
+    rt.exec(r#"put the screenRect & "|" & the windows & "|" & (the diskSpace > 1000) into field "search";"#); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "0,0,1280,800|card window\nmessage window|true");
+}
+
+#[test]
+fn hypertalk_precedence_and_put_to_the_message_box() {
+    let rt = Rt::new(demo::address_book());
+    for (src, want) in [("2 ^ 3", "8"), ("7 div 2 & \",\" & 7 mod 2", "3,1"), ("-2 ^ 2", "4"), ("2 + 3 * 4 = 14", "true"), ("1 < 2 = true", "true"),
+                        ("2 ^ 3 ^ 2", "64"), ("\"a\" & \"b\" = \"ab\"", "true"), ("1 + 1 & 2", "22"), ("\"12\" contains \"1\" and 2 > 1", "true"),
+                        ("10 - 2 - 3", "5"), ("2 * 3 mod 4", "2"), ("3 is in \"123\" or false", "true"), ("8 / 2 / 2", "2"), ("not true and false", "false")] {
+        rt.exec(&format!("put {src}")); no_error(&rt);
+        assert_eq!(rt.w.borrow().log.last().map(String::as_str), Some(want), "{src}");
+    }
+    rt.exec("hide message box"); no_error(&rt);
+    assert!(!rt.w.borrow().message_visible);
+    rt.exec("show msg"); no_error(&rt);
+    assert!(rt.w.borrow().message_visible);
 }

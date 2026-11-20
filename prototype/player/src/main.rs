@@ -58,6 +58,8 @@ thread_local! {
     static FOCUS_TEXT: RefCell<Option<(u32, String)>> = const { RefCell::new(None) };
     static LAST_DOWN: RefCell<(u32, f64)> = const { RefCell::new((0, 0.0)) };
     static DOUBLE: RefCell<bool> = const { RefCell::new(false) };
+    /// Set when a script quit HyperCard (doMenu "Quit HyperCard").
+    static QUIT: RefCell<bool> = const { RefCell::new(false) };
     /// Sounds whose data the browser side already holds.
     static SENT: RefCell<std::collections::HashSet<String>> = RefCell::new(Default::default());
 }
@@ -141,9 +143,14 @@ fn load(path: &str) -> StackFile {
     }
 }
 #[cfg(target_arch = "wasm32")]
-fn load(path: &str) -> StackFile { demo_for(path) }
+fn load(path: &str) -> StackFile {
+    // A stack a script made this session (create stack) lives in the in-memory file system.
+    let made = shared_fs().borrow().read_bytes(path).ok().and_then(|b| StackFile::from_bytes(&b).ok());
+    made.unwrap_or_else(|| demo_for(path))
+}
 
 /// Home lives next to the stacks, in its own file, and stays loaded when another stack opens.
+#[cfg(not(target_arch = "wasm32"))]
 fn home_path() -> String {
     PATH.with(|p| std::path::Path::new(p.borrow().as_str()).parent().map(|d| d.join("home.stack").to_string_lossy().into_owned()).unwrap_or_else(|| "home.stack".into()))
 }
@@ -255,6 +262,16 @@ fn close_tab(i: usize) {
 
 /// Things scripts asked the player to do: show another stack, fetch URLs, persist web files.
 fn handle_requests() {
+    // Built-in menu items: Undo, Message (focus the message box), Quit HyperCard.
+    let (undo, message, quit) = { let r = rt(); let mut w = r.w.borrow_mut(); (std::mem::take(&mut w.undo_request), std::mem::take(&mut w.message_request), std::mem::take(&mut w.quit_request)) };
+    if undo { rt().undo(); }
+    if message { let _ = document::eval("setTimeout(() => document.querySelector('.foot input')?.focus(), 0)"); }
+    if quit {
+        save();
+        QUIT.with(|q| *q.borrow_mut() = true);
+        #[cfg(feature = "desktop")]
+        dioxus::desktop::window().close();
+    }
     let go = rt().w.borrow_mut().go_stack.take();
     if let Some(g) = go {
         let path = real_path(&g.path);
@@ -499,6 +516,20 @@ input.t { font:inherit; padding:4px 8px; border:1px solid var(--line); border-ra
 .fx-shrink-to-top, .fx-stretch-from-top { animation: fx-wipe-down .5s ease backwards; }
 .fx-shrink-to-bottom, .fx-stretch-from-bottom { animation: fx-wipe-up .5s ease backwards; }
 @media (prefers-reduced-motion: reduce) { [class*="fx-"] { animation:none; } }
+.menubar { display:flex; align-items:center; gap:2px; padding:2px 8px; border-bottom:1px solid var(--line); background:#fff; font-size:13px; position:relative; z-index:20; }
+.menubar .menu { position:relative; }
+.menubar .mname { font:inherit; border:0; background:transparent; padding:3px 10px; border-radius:3px; cursor:pointer; }
+.menubar .mname.on, .menubar .mname:hover { background:var(--ink); color:#fff; }
+.menubar .drop { position:absolute; left:0; top:100%; min-width:180px; background:#fff; border:1px solid var(--ink); box-shadow:2px 2px 0 var(--ink); display:flex; flex-direction:column; padding:3px 0; }
+.menubar .item { font:inherit; text-align:left; border:0; background:transparent; padding:4px 14px; cursor:pointer; white-space:nowrap; }
+.menubar .item:hover:not(.off) { background:var(--ink); color:#fff; }
+.menubar .item.off { color:#aaa; cursor:default; }
+.menubar .sep { border-top:1px dotted #999; margin:3px 0; }
+.menubar .toolpick { display:flex; gap:6px; align-items:center; color:var(--muted); }
+.menubar .sp { flex:1; }
+.paintlayer { position:absolute; inset:0; pointer-events:none; }
+.paintlayer svg { display:block; }
+.paintcatch { position:absolute; inset:0; z-index:40; cursor:crosshair; }
 label.t { display:inline-flex; align-items:center; font:inherit; padding:4px 10px; border:1px solid var(--line); background:#fff; border-radius:4px; cursor:pointer; }
 label.t input { display:none; }
 .assets { display:flex; flex-direction:column; gap:4px; font-size:13px; }
@@ -516,6 +547,9 @@ fn App() -> Element {
     let mut drag = use_signal(|| None::<(f64, f64, f64, f64)>);
     let mut new_card_form = use_signal(|| None::<(String, String)>);
     let mut msg = use_signal(String::new);
+    // The open menu in the menu bar, and the stroke being painted (card coordinates).
+    let mut open_menu = use_signal(|| None::<usize>);
+    let mut stroke = use_signal(Vec::<(f64, f64)>::new);
     let mut ask_text = use_signal(String::new);
     let mut file_dir = use_signal(|| None::<String>);
     let mut compile_us = use_signal(|| 0u128);
@@ -532,7 +566,13 @@ fn App() -> Element {
         let mut last_idle = 0.0f64;
         while let Ok(t) = raf.recv::<f64>().await {
             // `edit the script of …` opens the editor on that object.
-            if let Some(id) = rt().w.borrow_mut().edit_request.take() { edit.set(true); sel.set(Some(id)); multi.set(vec![]); tick += 1; }
+            if let Some(id) = rt().w.borrow_mut().edit_request.take() { rt().w.borrow_mut().tool = "button".into(); edit.set(true); sel.set(Some(id)); multi.set(vec![]); tick += 1; }
+            // `choose button tool` / `choose browse tool` from a script switch the player's mode.
+            {
+                let tool = rt().w.borrow().tool.clone();
+                let wants_edit = tool == "button" || tool == "field";
+                if wants_edit != edit() { edit.set(wants_edit); tick += 1; }
+            }
             if DIRTY.with(|d| std::mem::take(&mut *d.borrow_mut())) { flush_sound(); tick += 1; }
             #[cfg(not(target_arch = "wasm32"))]
             if deliver_fetches() { flush_sound(); tick += 1; }
@@ -581,11 +621,30 @@ fn App() -> Element {
         let mut ch = document::eval(r#"
             document.addEventListener('selectionchange', () => { const a = document.activeElement; if (a && a.dataset && a.dataset.id) dioxus.send(['sel', +a.dataset.id, a.selectionStart, a.selectionEnd]); });
             let t; window.addEventListener('resize', () => { clearTimeout(t); t = setTimeout(() => dioxus.send(['size', innerWidth, innerHeight, 0]), 150); });
+            dioxus.send(['size', innerWidth, innerHeight, 1]);
+            document.addEventListener('visibilitychange', () => dioxus.send(['vis', document.hidden ? 1 : 0, 0, 0]));
+            let sx = screenX, sy = screenY;
+            dioxus.send(['move', sx, sy, 1]);
+            setInterval(() => { if (screenX !== sx || screenY !== sy) { sx = screenX; sy = screenY; dioxus.send(['move', sx, sy, 0]); } }, 500);
             await new Promise(() => {});"#);
         while let Ok((kind, a, b, c)) = ch.recv::<(String, f64, f64, f64)>().await {
             let r = rt();
-            if kind == "sel" { r.w.borrow_mut().selection = Some((a as u32, b as usize, c as usize)); }
-            else if !edit() { let card = r.w.borrow().current_card(); r.send_with(card, "sizeWindow", vec![]); save(); tick += 1; }
+            let card = r.w.borrow().current_card();
+            match kind.as_str() {
+                "sel" => r.w.borrow_mut().selection = Some((a as u32, b as usize, c as usize)),
+                // The window's size and place, for the screenRect; sizeWindow and moveWindow when they change.
+                "size" => {
+                    TABS.with(|t| for tab in t.borrow().iter() { tab.rt.w.borrow_mut().screen = (a, b); });
+                    if c == 0.0 && !edit() { r.send_with(card, "sizeWindow", vec![]); save(); tick += 1; }
+                }
+                "move" => {
+                    TABS.with(|t| for tab in t.borrow().iter() { tab.rt.w.borrow_mut().window_loc = (a, b); });
+                    if c == 0.0 && !edit() { r.send_with(card, "moveWindow", vec![]); save(); tick += 1; }
+                }
+                // The player hidden or shown again (another window or tab in front): suspend / resume.
+                "vis" => { r.send_with(card, if a == 1.0 { "suspend" } else { "resume" }, vec![]); handle_requests(); save(); tick += 1; }
+                _ => {}
+            }
         }
     });
 
@@ -673,7 +732,10 @@ fn App() -> Element {
     let (fps, frame_us) = stats();
     // The user level (HyperCard's five): below 4 there is no editing, at 4 no script editing, at 1 no typing.
     let user_level = r.w.borrow().user_level;
-    if edit() && user_level < 4 { edit.set(false); }
+    let (tool, menus, message_visible, paint) = { let w = r.w.borrow(); (w.tool.clone(), w.menus.clone(), w.message_visible, w.get(card, "paint").text()) };
+    let painting = !edit() && user_level >= 3 && !matches!(tool.as_str(), "browse" | "button" | "field");
+    let paint_svg_markup = paint_svg(&paint, if painting && !stroke().is_empty() { Some((tool.as_str(), r.w.borrow().line_size, r.w.borrow().filled, stroke())) } else { None }, width, height);
+    if edit() && user_level < 4 { edit.set(false); r.w.borrow_mut().tool = "browse".into(); }
     let editing = edit() && user_level >= 4;
     let target = sel().filter(|id| r.w.borrow().obj(*id).is_some()).unwrap_or(card);
     let (t_kind, t_name, t_script, t_text, t_rect, t_err) = {
@@ -769,6 +831,13 @@ fn App() -> Element {
                 }
                 let key = e.key().to_string();
                 rt().w.borrow_mut().keys.insert(key.clone());
+                // F1 … F15: functionKey <n>.
+                if !editing { if let Some(n) = key.strip_prefix('F').and_then(|n| n.parse::<i64>().ok()).filter(|n| (1..=15).contains(n)) {
+                    let card = rt().w.borrow().current_card();
+                    if rt().send_with(card, "functionKey", vec![Value::Int(n)]) { e.prevent_default(); }
+                    done();
+                    return;
+                } }
                 if !editing && (e.modifiers().ctrl() || e.modifiers().meta()) && key.chars().count() == 1 {
                     let card = rt().w.borrow().current_card();
                     if rt().send_with(card, "commandKeyDown", vec![Value::Str(key.clone())]) { e.prevent_default(); }
@@ -791,6 +860,13 @@ fn App() -> Element {
                 }
             },
             onkeyup: move |e| { rt().w.borrow_mut().keys.remove(&e.key().to_string()); },
+            if QUIT.with(|q| *q.borrow()) {
+                div { class: "veil", style: "z-index:1000",
+                    div { class: "dlg", p { "HyperCard has quit. Your stacks are saved." }
+                        div { class: "row", button { class: "t on", onclick: move |_| { let _ = document::eval("location.reload()"); }, "Start again" } }
+                    }
+                }
+            }
             div { class: "tabs",
                 for (i, (tname, active)) in TABS.with(|t| t.borrow().iter().enumerate().map(|(i, tab)| (tab.rt.w.borrow().file.name.clone(), i == ACTIVE.with(|a| *a.borrow()))).collect::<Vec<_>>()).into_iter().enumerate() {
                     div { key: "{i}", class: if active { "tab on" } else { "tab" },
@@ -801,10 +877,44 @@ fn App() -> Element {
                     }
                 }
             }
+            div { class: "menubar", onmouseleave: move |_| open_menu.set(None),
+                for (mi, m) in menus.into_iter().enumerate() {
+                    div { key: "{mi}", class: "menu",
+                        button { class: if open_menu() == Some(mi) { "mname on" } else { "mname" },
+                            onclick: move |_| open_menu.set(if open_menu() == Some(mi) { None } else { Some(mi) }),
+                            onmouseenter: move |_| { if open_menu().is_some() { open_menu.set(Some(mi)); } },
+                            "{m.name}" }
+                        if open_menu() == Some(mi) {
+                            div { class: "drop",
+                                for (ii, it) in m.items.clone().into_iter().enumerate() {
+                                    if it.text == "-" { div { key: "{ii}", class: "sep" } }
+                                    else {
+                                        { let (text, mname) = (it.text.clone(), m.name.clone());
+                                          rsx! { button { key: "{ii}", class: if it.enabled { "item" } else { "item off" }, disabled: !it.enabled,
+                                              onclick: move |_| { open_menu.set(None); rt().do_menu(&text, &mname); done(); },
+                                              if it.checked { "✓ " } "{it.text}" } } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if user_level >= 3 {
+                    span { class: "sp" }
+                    label { class: "toolpick", "Tool "
+                        select { class: "t", value: "{tool}",
+                            onchange: move |e| { rt().exec(&format!("choose {} tool;", e.value())); done(); },
+                            for t in stack_core::TOOLS.iter().filter(|t| user_level >= 4 || !matches!(**t, "button" | "field")).filter(|t| !matches!(**t, "select" | "lasso" | "bucket" | "text")) {
+                                option { value: "{t}", selected: *t == tool, "{t}" }
+                            }
+                        }
+                    }
+                }
+            }
             div { class: "bar",
                 b { "{name}" }
-                button { class: if !editing { "t on" } else { "t" }, onclick: move |_| { edit.set(false); drag.set(None); }, "Browse" }
-                if user_level >= 4 { button { class: if editing { "t on" } else { "t" }, onclick: move |_| edit.set(true), "Edit" } }
+                button { class: if !editing { "t on" } else { "t" }, onclick: move |_| { edit.set(false); drag.set(None); rt().w.borrow_mut().tool = "browse".into(); }, "Browse" }
+                if user_level >= 4 { button { class: if editing { "t on" } else { "t" }, onclick: move |_| { edit.set(true); rt().w.borrow_mut().tool = "button".into(); }, "Edit" } }
                 if editing {
                     button { class: "t", onclick: move |_| { let mut f = new_part; f(Kind::Button) }, "+ Button" }
                     button { class: "t", onclick: move |_| { let mut f = new_part; f(Kind::Field) }, "+ Field" }
@@ -949,6 +1059,17 @@ fn App() -> Element {
                                 done();
                             }
                         },
+                        div { class: "paintlayer", dangerous_inner_html: "{paint_svg_markup}" }
+                        // With a paint tool, the card is for painting: drags become strokes.
+                        if painting {
+                            div { class: "paintcatch",
+                                onmousedown: move |e| { e.stop_propagation(); let p = e.element_coordinates(); stroke.set(vec![(p.x, p.y)]); },
+                                onmousemove: move |e| { if !stroke().is_empty() { let p = e.element_coordinates(); stroke.write().push((p.x, p.y)); } },
+                                onmouseup: move |e| { e.stop_propagation(); let pts = stroke(); stroke.set(vec![]); if !pts.is_empty() { rt().paint(&pts); done(); } },
+                                onmouseleave: move |_| { let pts = stroke(); stroke.set(vec![]); if !pts.is_empty() { rt().paint(&pts); done(); } },
+                                onclick: move |e| e.stop_propagation(),
+                            }
+                        }
                         for p in parts.into_iter().filter(|p| p.visible || editing) {
                             div {
                                 key: "{p.id}",
@@ -1162,10 +1283,10 @@ fn App() -> Element {
                 }
             }
             div { class: "foot",
-                input { placeholder: "message box: type a statement and press Enter, e.g.  go next;   or   put \"hi\" into field \"notes\";", value: "{msg}",
+                if message_visible { input { placeholder: "message box: type a statement and press Enter, e.g.  go next;   or   put \"hi\" into field \"notes\";", value: "{msg}",
                     oninput: move |e| msg.set(e.value()),
                     onkeydown: move |e| { e.stop_propagation(); if e.key() == Key::Enter { rt().exec(&msg()); msg.set(String::new()); done(); } }
-                }
+                } }
                 if let Some(err) = error { div { class: "bad", "{err}" } }
                 if !log.is_empty() { div { class: "log", "{log}" } }
             }
@@ -1220,6 +1341,53 @@ fn App() -> Element {
             }
         }
     }
+}
+
+/// The card's paint as SVG: one shape per stroke ("<tool> <lineSize> <filled> h,v h,v …"), plus the stroke
+/// being painted. Black ink on the card, as in HyperCard; the eraser paints the card colour.
+fn paint_svg(paint: &str, live: Option<(&str, i64, bool, Vec<(f64, f64)>)>, w: i64, h: i64) -> String {
+    let mut out = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">"#);
+    let mut shape = |tool: &str, size: i64, filled: bool, pts: &[(f64, f64)]| {
+        if pts.is_empty() { return; }
+        let ink = "#111";
+        let (a, b) = (pts[0], *pts.last().unwrap());
+        let poly = |pts: &[(f64, f64)]| pts.iter().map(|(x, y)| format!("{x:.0},{y:.0}")).collect::<Vec<_>>().join(" ");
+        let fill = if filled { ink } else { "none" };
+        let (x, y, bw, bh) = (a.0.min(b.0), a.1.min(b.1), (a.0 - b.0).abs(), (a.1 - b.1).abs());
+        let line = |width: f64, color: &str, extra: &str| if pts.len() == 1 {
+            format!(r#"<circle cx="{:.0}" cy="{:.0}" r="{}" fill="{color}"/>"#, a.0, a.1, (width / 2.0).max(0.5))
+        } else {
+            format!(r#"<polyline points="{}" fill="none" stroke="{color}" stroke-width="{width}" stroke-linecap="round" stroke-linejoin="round" {extra}/>"#, poly(pts))
+        };
+        out.push_str(&match tool {
+            "pencil" => line(1.0, ink, ""),
+            "brush" => line(6.0, ink, ""),
+            "eraser" => line(14.0, "#fff", ""),
+            "spray" => line(8.0, ink, r#"stroke-dasharray="0.5 4" opacity="0.7""#),
+            "curve" | "polygon" => line(size as f64, ink, ""),
+            "line" => format!(r#"<line x1="{:.0}" y1="{:.0}" x2="{:.0}" y2="{:.0}" stroke="{ink}" stroke-width="{size}" stroke-linecap="round"/>"#, a.0, a.1, b.0, b.1),
+            "rectangle" => format!(r#"<rect x="{x:.0}" y="{y:.0}" width="{bw:.0}" height="{bh:.0}" fill="{fill}" stroke="{ink}" stroke-width="{size}"/>"#),
+            "round_rect" | "round rect" => format!(r#"<rect x="{x:.0}" y="{y:.0}" width="{bw:.0}" height="{bh:.0}" rx="10" fill="{fill}" stroke="{ink}" stroke-width="{size}"/>"#),
+            "oval" => format!(r#"<ellipse cx="{:.0}" cy="{:.0}" rx="{:.0}" ry="{:.0}" fill="{fill}" stroke="{ink}" stroke-width="{size}"/>"#, x + bw / 2.0, y + bh / 2.0, bw / 2.0, bh / 2.0),
+            "regular_polygon" | "regular polygon" => {
+                // Drawn from its centre, as in HyperCard: six sides through the end point.
+                let r = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+                let t0 = (b.1 - a.1).atan2(b.0 - a.0);
+                let v: Vec<(f64, f64)> = (0..6).map(|k| { let t = t0 + k as f64 * std::f64::consts::PI / 3.0; (a.0 + r * t.cos(), a.1 + r * t.sin()) }).collect();
+                format!(r#"<polygon points="{}" fill="{fill}" stroke="{ink}" stroke-width="{size}"/>"#, poly(&v))
+            }
+            _ => String::new(),
+        });
+    };
+    for l in paint.lines() {
+        let mut it = l.split_whitespace();
+        let (Some(tool), Some(size), Some(filled)) = (it.next(), it.next(), it.next()) else { continue };
+        let pts: Vec<(f64, f64)> = it.filter_map(|p| p.split_once(',')).filter_map(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?))).collect();
+        shape(tool, size.parse().unwrap_or(1), filled == "1", &pts);
+    }
+    if let Some((tool, size, filled, pts)) = live { shape(tool, size, filled, &pts); }
+    out.push_str("</svg>");
+    out
 }
 
 /// Asset name from a file name (without extension) and its media type from the extension.

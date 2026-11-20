@@ -1,6 +1,6 @@
 //! Script engine: stock Rhai plus English-shaped commands, and the message path.
 //! Path: part -> card -> background -> stack -> built-in. Commands are messages first.
-use crate::model::{canon_prop, GoStack, Kind, Obj, OpenFile, Shape, SoundCmd, StackFile, Value, World, HOME, LIB0, VISIT0};
+use crate::model::{canon_prop, default_menus, GoStack, Kind, Menu, MenuItem, Obj, OpenFile, Shape, SoundCmd, StackFile, Value, World, HOME, LIB0, TOOLS, VISIT0};
 use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString, Position, Scope, AST};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -163,7 +163,7 @@ impl Tape {
 }
 
 #[derive(Clone)]
-struct Settle { sounds: usize, urls: usize, go: Option<GoStack>, edit: Option<u32> }
+struct Settle { sounds: usize, urls: usize, go: Option<GoStack>, edit: Option<u32>, requests: (bool, bool, bool) }
 
 /// The run reached live again: drop what it queued for the player a second time.
 fn settle(w: &W, live: &L) {
@@ -173,6 +173,7 @@ fn settle(w: &W, live: &L) {
     wb.url_requests.truncate(s.urls);
     wb.go_stack = s.go;
     wb.edit_request = s.edit;
+    (wb.undo_request, wb.message_request, wb.quit_request) = s.requests;
 }
 
 const PAUSED: &str = "\u{2}paused";
@@ -229,6 +230,7 @@ impl crate::files::Fs for TapeFs {
     fn read(&self, path: &str) -> Result<String, String> { self.rec(format!("read {path}"), || self.inner.borrow().read(path)) }
     fn read_bytes(&self, path: &str) -> Result<Vec<u8>, String> { self.rec(format!("read bytes {path}"), || self.inner.borrow().read_bytes(path)) }
     fn write(&mut self, path: &str, text: &str) -> Result<(), String> { self.rec(format!("write {path}"), || self.inner.borrow_mut().write(path, text)) }
+    fn write_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> { self.rec(format!("write bytes {path}"), || self.inner.borrow_mut().write_bytes(path, bytes)) }
     fn delete(&mut self, path: &str) -> Result<(), String> { self.rec(format!("delete {path}"), || self.inner.borrow_mut().delete(path)) }
     fn rename(&mut self, from: &str, to: &str) -> Result<(), String> { self.rec(format!("rename {from}"), || self.inner.borrow_mut().rename(from, to)) }
     fn create_folder(&mut self, path: &str) -> Result<(), String> { self.rec(format!("create folder {path}"), || self.inner.borrow_mut().create_folder(path)) }
@@ -253,7 +255,7 @@ struct Snap {
     mark: usize, txn: u64, next_id: u32, current_card: u32, log_len: usize, result: String, item_delim: String,
     timers: Vec<(f64, u32, String)>, push_list: Vec<u32>, selection: Option<(u32, usize, usize)>, focused: Option<u32>,
     user_level: i64, open_files: HashMap<String, OpenFile>, effect: Option<String>, effect_seq: u64, sound: Option<String>,
-    draw: HashMap<u32, Vec<Shape>>, mouse_click: bool, click_loc: (f64, f64), libs: Vec<Obj>, visited: Vec<Obj>, globals: HashMap<String, Dynamic>, seed: u64,
+    draw: HashMap<u32, Vec<Shape>>, mouse_click: bool, click_loc: (f64, f64), libs: Vec<Obj>, visited: Vec<Obj>, tool: String, line_size: i64, filled: bool, menus: Vec<Menu>, recent: Vec<u32>, lock_recent: bool, globals: HashMap<String, Dynamic>, seed: u64,
 }
 
 struct Paused { entry: Entry, snap: Snap, tape: Vec<(String, Dynamic)> }
@@ -324,6 +326,7 @@ fn navigate(engine: &Engine, w: &W, live: &L, target: u32) -> R<()> {
     // Handlers for system messages write "automatic" changes, which Undo skips.
     // With lockMessages set, the card changes silently.
     let quiet = w.borrow().lock_messages;
+    { let mut wb = w.borrow_mut(); if !wb.lock_recent { wb.recent.push(from); if wb.recent.len() > 200 { wb.recent.remove(0); } } }
     let (bg_from, bg_to) = { let wb = w.borrow(); (wb.background_of(from), wb.background_of(target)) };
     w.borrow_mut().auto_depth += 1;
     let send = |id: u32, m: &str| -> R<bool> { if quiet { Ok(false) } else { dispatch(engine, w, live, id, m, vec![]) } };
@@ -753,13 +756,14 @@ fn build_engine(w: &W, live: &L) -> Engine {
     }
 
     // put <expr> into|before|after [<chunk> <n> of ...] <variable | field <name>>
+    // put <expr>   (no destination): shows it in the message box, as in HyperCard
     { let (w, live) = (w.clone(), live.clone());
       e.register_custom_syntax_with_state_raw("put",
         |syms: &[ImmutableString], look: &str, state: &mut Dynamic| {
             if syms.len() == 1 { *state = Dynamic::from(PutSt::default()); return Ok(Some("$expr$".into())); }
             let mut st = state.clone_cast::<PutSt>();
             let next: Option<ImmutableString> = match st.phase {
-                0 => { st.phase = 1; st.mode = look.to_string(); Some(if matches!(look, "into" | "before" | "after") { look.into() } else { "into".into() }) }
+                0 => if matches!(look, "into" | "before" | "after") { st.phase = 1; st.mode = look.to_string(); Some(look.into()) } else { None },
                 1 => if CHUNKS.contains(&look) { st.kinds.push(look.into()); st.ranged.push(false); st.phase = 2; Some(look.into()) }
                      else if look == "field" { st.field = true; st.phase = 4; Some("field".into()) }
                      else if look == "file" { st.file = true; st.phase = 4; Some("file".into()) }
@@ -777,6 +781,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
         move |ctx, inputs, state| {
             let st = state.clone_cast::<PutSt>();
             let v = ctx.eval_expression_tree(&inputs[0])?;
+            if st.mode.is_empty() { w.borrow_mut().log.push(v.to_string()); return Ok(Dynamic::UNIT); }
             if st.selection {
                 // put … into|before|after the selection
                 let Some((f, a, b)) = w.borrow().selection else { return Err(err("there is no selection")) };
@@ -866,6 +871,9 @@ fn build_engine(w: &W, live: &L) -> Engine {
                     }
                     "itemDelimiter" => { let d = val.to_string(); if d.is_empty() { return Err(err("itemDelimiter cannot be empty")) } DELIM.with(|x| *x.borrow_mut() = d.clone()); wb.item_delim = d; Ok(Dynamic::UNIT) }
                     "lockScreen" => { wb.locked = from_dyn(&val).truthy(); Ok(Dynamic::UNIT) }
+                    "lineSize" => { let n = from_dyn(&val).int(); if !(1..=8).contains(&n) { return Err(err("lineSize is 1 to 8")) } wb.line_size = n; Ok(Dynamic::UNIT) }
+                    "filled" => { wb.filled = from_dyn(&val).truthy(); Ok(Dynamic::UNIT) }
+                    "lockRecent" => { wb.lock_recent = from_dyn(&val).truthy(); Ok(Dynamic::UNIT) }
                     "lockMessages" => { wb.lock_messages = from_dyn(&val).truthy(); Ok(Dynamic::UNIT) }
                     other => Err(err(&format!("set the {other} of what? write: set the {other} of <object> to …"))),
                 };
@@ -1004,6 +1012,19 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 "selectedfield" => Dynamic::from(wb.selection.map(|(f, _, _)| wb.get(f, "name").text()).unwrap_or_default()),
                 "selectedchunk" => Dynamic::from(wb.selection.map(|(f, a, b)| format!("char {} to {} of field \"{}\"", a + 1, b, wb.get(f, "name").text())).unwrap_or_default()),
                 "itemdelimiter" => Dynamic::from(wb.item_delim.clone()),
+                "tool" => Dynamic::from(format!("{} tool", wb.tool)),
+                "linesize" => Dynamic::from(wb.line_size),
+                "filled" => Dynamic::from(wb.filled),
+                "lockrecent" => Dynamic::from(wb.lock_recent),
+                "menus" => Dynamic::from(wb.menus.iter().map(|m| m.name.clone()).collect::<Vec<_>>().join("\n")),
+                // The card window and the message box, then the other stacks open in the player.
+                "windows" => Dynamic::from(std::iter::once("card window".to_string()).chain(std::iter::once("message window".to_string()))
+                    .chain(wb.open_stacks.iter().filter(|s| **s != wb.file.name).cloned()).collect::<Vec<_>>().join("\n")),
+                "screenrect" => Dynamic::from(format!("0,0,{},{}", wb.screen.0.round(), wb.screen.1.round())),
+                "windowloc" | "loc of card window" => Dynamic::from(format!("{},{}", wb.window_loc.0.round(), wb.window_loc.1.round())),
+                // Memory and disk are not limits here; these report HyperCard-sized room to spare, not a measurement.
+                "diskspace" | "heapspace" | "stackspace" | "freesize" => Dynamic::from(i32::MAX as i64),
+                "systemversion" => Dynamic::from(format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)),
                 "lockscreen" => Dynamic::from(wb.locked),
                 "lockmessages" => Dynamic::from(wb.lock_messages),
                 "commandkey" => Dynamic::from(key_state(&["Meta", "Control"])),
@@ -1141,6 +1162,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
             let st = state.clone_cast::<ThereSt>();
             let key = if st.r.has_key { Some(ctx.eval_expression_tree(&inputs[0])?) } else { None };
             let exists = match st.r.kind.as_str() {
+                "menu" => { let n = key.map(|k| k.to_string()).unwrap_or_default(); w.borrow().menus.iter().any(|m| m.name.eq_ignore_ascii_case(&n)) }
                 "file" | "folder" => {
                     let wb = w.borrow();
                     let p = wb.path(&key.map(|k| k.to_string()).unwrap_or_default());
@@ -1277,6 +1299,185 @@ fn build_engine(w: &W, live: &L) -> Engine {
         });
     }
 
+    // choose <tool name> tool | choose tool <number>   (HyperCard's order: 1 browse, 2 button, 3 field, 6 pencil, …)
+    { let w = w.clone();
+      e.register_custom_syntax_with_state_raw("choose",
+        |syms: &[ImmutableString], look: &str, state: &mut Dynamic| {
+            if syms.len() == 1 { *state = Dynamic::from(String::new()); if look == "tool" { return Ok(Some("tool".into())); } }
+            let last = syms.last().map(|s| s.as_str()).unwrap_or("");
+            if syms.len() == 2 && last == "tool" { return Ok(Some("$expr$".into())); }
+            if last == "tool" || last == "$expr$" { return Ok(None); }
+            if look == "tool" { return Ok(Some("tool".into())); }
+            if !look.chars().next().is_some_and(|c| c.is_alphabetic()) { return Ok(None); }
+            *state = Dynamic::from(format!("{} {}", state, look.to_lowercase()));
+            Ok(Some(look.into()))
+        }, false,
+        move |ctx, inputs, state| {
+            let name = if inputs.is_empty() {
+                state.to_string().split_whitespace().filter(|w| *w != "can").collect::<Vec<_>>().join(" ")
+            } else {
+                let n = from_dyn(&ctx.eval_expression_tree(&inputs[0])?).int();
+                TOOLS.get((n - 1).max(0) as usize).filter(|_| n >= 1).ok_or_else(|| err("choose tool 1 to 18"))?.to_string()
+            };
+            let name = match name.as_str() { "rect" => "rectangle".to_string(), "roundrect" | "round rectangle" => "round rect".to_string(), n => n.to_string() };
+            let i = TOOLS.iter().position(|t| *t == name).ok_or_else(|| err(&format!("choose what? no {name} tool")))?;
+            let level = w.borrow().user_level;
+            let need = match i { 0 => 1, 1 | 2 => 4, _ => 3 };
+            if level < need { return Err(err(&format!("the {name} tool needs userLevel {need} or more"))); }
+            w.borrow_mut().tool = name;
+            Ok(Dynamic::UNIT)
+        });
+    }
+
+    // drag from <point> to <point> [with shiftKey|optionKey|commandKey, …]
+    // With the browse tool: mouseDown, mouseStillDown along the way, mouseUp (if it ends where it started).
+    // With the button or field tool: moves the button or field under the start point. With a paint tool: paints.
+    { let (w, live) = (w.clone(), live.clone());
+      e.register_custom_syntax_with_state_raw("drag",
+        |syms: &[ImmutableString], look: &str, _| Ok(match (syms.len(), syms.last().map(|s| s.as_str()).unwrap_or("")) {
+            (1, _) => Some("from".into()),
+            (2, _) => Some("$expr$".into()),
+            (3, _) => Some("to".into()),
+            (4, _) => Some("$expr$".into()),
+            (5, _) => if look == "with" { Some("with".into()) } else { None },
+            (_, "with") | (_, ",") => Some("$ident$".into()),
+            (_, "$ident$") => if look == "," { Some(",".into()) } else { None },
+            _ => None,
+        }), false,
+        move |ctx, inputs, _| {
+            let pt = |d: Dynamic| -> R<(f64, f64)> { let p: Vec<f64> = d.to_string().split(',').filter_map(|x| x.trim().parse().ok()).collect(); if p.len() == 2 { Ok((p[0], p[1])) } else { Err(err("drag needs points \"h,v\"")) } };
+            let a = pt(ctx.eval_expression_tree(&inputs[0])?)?;
+            let b = pt(ctx.eval_expression_tree(&inputs[1])?)?;
+            let keys: Vec<String> = inputs[2..].iter().filter_map(|i| i.get_string_value()).map(|k| match k.to_lowercase().as_str() { "shiftkey" => "Shift", "optionkey" => "Alt", "commandkey" | "cmdkey" => "Meta", _ => "" }.to_string()).filter(|k| !k.is_empty()).collect();
+            let tool = w.borrow().tool.clone();
+            if is_paint_tool(&tool) {
+                if matches!(tool.as_str(), "select" | "lasso" | "bucket" | "text") { w.borrow_mut().result = format!("The {tool} tool does not paint here."); return Ok(Dynamic::UNIT); }
+                let mut wb = w.borrow_mut();
+                let card = wb.current_card();
+                add_stroke(&mut wb, card, &[a, b]);
+                return Ok(Dynamic::UNIT);
+            }
+            if tool == "button" || tool == "field" {
+                let kind = if tool == "button" { Kind::Button } else { Kind::Field };
+                let mut wb = w.borrow_mut();
+                if let Some(id) = part_at(&wb, a, &[kind]) {
+                    let (l, t) = (wb.get(id, "left").int(), wb.get(id, "top").int());
+                    wb.set(id, "left", Value::Int(l + (b.0 - a.0).round() as i64), false);
+                    wb.set(id, "top", Value::Int(t + (b.1 - a.1).round() as i64), false);
+                }
+                return Ok(Dynamic::UNIT);
+            }
+            let (target, rect) = {
+                let wb = w.borrow();
+                match part_at(&wb, a, &[Kind::Button, Kind::Field, Kind::Canvas]) {
+                    Some(id) => (id, Some(["left", "top", "width", "height"].map(|k| wb.get(id, k).int() as f64))),
+                    None => (wb.current_card(), None),
+                }
+            };
+            { let mut wb = w.borrow_mut(); for k in &keys { wb.keys.insert(k.clone()); } wb.mouse = a; wb.mouse_down = true; wb.click_loc = a; wb.pressed = Some(target); }
+            let mut r = dispatch(ctx.engine(), &w, &live, target, "mouseDown", vec![]).map(|_| ());
+            for i in 1..=8 {
+                if r.is_err() { break; }
+                let f = i as f64 / 8.0;
+                w.borrow_mut().mouse = (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f);
+                r = dispatch(ctx.engine(), &w, &live, target, "mouseStillDown", vec![]).map(|_| ());
+            }
+            { let mut wb = w.borrow_mut(); wb.mouse = b; wb.mouse_down = false; wb.pressed = None; }
+            let inside = rect.map(|q| b.0 >= q[0] && b.0 < q[0] + q[2] && b.1 >= q[1] && b.1 < q[1] + q[3]).unwrap_or(true);
+            if r.is_ok() && inside { r = dispatch(ctx.engine(), &w, &live, target, "mouseUp", vec![]).map(|_| ()); }
+            { let mut wb = w.borrow_mut(); for k in &keys { wb.keys.remove(k); } }
+            r.map(|_| Dynamic::UNIT)
+        });
+    }
+
+    // reset paint: lineSize 1, not filled
+    { let w = w.clone();
+      e.register_custom_syntax_with_state_raw("reset",
+        |syms: &[ImmutableString], look: &str, _| Ok(if syms.len() == 1 { Some(look.into()) } else { None }), false,
+        move |_, _, _| { let mut wb = w.borrow_mut(); wb.line_size = 1; wb.filled = false; Ok(Dynamic::UNIT) }); }
+
+    // menu "<name>": its items, one per line
+    { let w = w.clone();
+      e.register_custom_syntax_with_state_raw("menu",
+        |syms: &[ImmutableString], look: &str, _| Ok(if syms.len() == 1 { Some(slot(look)) } else { None }), false,
+        move |ctx, inputs, _| {
+            let n = ctx.eval_expression_tree(&inputs[0])?.to_string();
+            let wb = w.borrow();
+            let m = wb.menus.iter().find(|m| m.name.eq_ignore_ascii_case(&n)).ok_or_else(|| err(&format!("no menu \"{n}\"")))?;
+            Ok(Dynamic::from(m.items.iter().map(|i| i.text.clone()).collect::<Vec<_>>().join("\n")))
+        }); }
+
+    // Menus (statements rewritten by `menu_statement`).
+    { let w = w.clone(); e.register_fn("__messageBox", move |on: bool| { let mut wb = w.borrow_mut(); wb.message_visible = on; if on { wb.message_request = true; } }); }
+    { let w = w.clone(); e.register_fn("__menuReset", move || { w.borrow_mut().menus = default_menus(); }); }
+    { let w = w.clone(); e.register_fn("__menuDelete", move |name: Dynamic| -> R<()> {
+        let n = name.to_string();
+        let mut wb = w.borrow_mut();
+        let i = wb.menus.iter().position(|m| m.name.eq_ignore_ascii_case(&n)).ok_or_else(|| err(&format!("no menu \"{n}\"")))?;
+        wb.menus.remove(i);
+        Ok(())
+    }); }
+    { let w = w.clone(); e.register_fn("__menuPut", move |value: Dynamic, how: &str, name: Dynamic, msgs: Dynamic| -> R<()> {
+        let n = name.to_string();
+        let mut wb = w.borrow_mut();
+        let m = wb.menus.iter_mut().find(|m| m.name.eq_ignore_ascii_case(&n)).ok_or_else(|| err(&format!("no menu \"{n}\"")))?;
+        // Items are separated by returns or commas; menuMessages likewise, one per item.
+        let split = |s: String| -> Vec<String> { if s.is_empty() { vec![] } else { s.split(|c| c == '\n' || c == ',').map(|x| x.trim().to_string()).collect() } };
+        let msgs = split(msgs.to_string());
+        let items: Vec<MenuItem> = split(value.to_string()).into_iter().enumerate().map(|(i, t)| { let mut it = MenuItem::new(&t); it.message = msgs.get(i).cloned().unwrap_or_default(); it }).collect();
+        match how { "into" => m.items = items, "before" => { let mut v = items; v.extend(m.items.drain(..)); m.items = v; } _ => m.items.extend(items) }
+        Ok(())
+    }); }
+    { let w = w.clone(); e.register_fn("__menuItem", move |op: &str, item: Dynamic, name: Dynamic| -> R<()> {
+        let (it, n) = (item.to_string(), name.to_string());
+        let mut wb = w.borrow_mut();
+        let m = wb.menus.iter_mut().find(|m| m.name.eq_ignore_ascii_case(&n)).ok_or_else(|| err(&format!("no menu \"{n}\"")))?;
+        if it.is_empty() { for i in &mut m.items { i.enabled = op == "enable"; } return Ok(()); }
+        let k = match it.trim().parse::<usize>() { Ok(k) if k >= 1 => Some(k - 1), _ => m.items.iter().position(|i| i.text.eq_ignore_ascii_case(&it)) }
+            .filter(|k| *k < m.items.len()).ok_or_else(|| err(&format!("no menu item \"{it}\" in menu \"{n}\"")))?;
+        match op { "delete" => { m.items.remove(k); } "enable" => m.items[k].enabled = true, "disable" => m.items[k].enabled = false, "check" => m.items[k].checked = true, "uncheck" => m.items[k].checked = false, _ => {} }
+        Ok(())
+    }); }
+
+    // doMenu <item> [, <menu>]: an item with a menuMessage sends that message; otherwise `doMenu item, menu`
+    // goes to the current card, and when no handler takes it the item does its built-in action.
+    for args in [1, 2] {
+        let (w, live) = (w.clone(), live.clone());
+        let f = move |ctx: rhai::NativeCallContext, item: String, menu: String| -> R<()> {
+            let found = {
+                let wb = w.borrow();
+                wb.menus.iter().filter(|m| menu.is_empty() || m.name.eq_ignore_ascii_case(&menu))
+                    .find_map(|m| m.items.iter().find(|i| i.text.eq_ignore_ascii_case(&item)).map(|i| (m.name.clone(), i.clone())))
+            };
+            let card = w.borrow().current_card();
+            if let Some((_, i)) = &found {
+                if !i.enabled { return Ok(()); }
+                if !i.message.is_empty() { dispatch(ctx.engine(), &w, &live, card, &i.message, vec![])?; return Ok(()); }
+            }
+            let menu_name = found.as_ref().map(|f| f.0.clone()).unwrap_or(menu);
+            if dispatch(ctx.engine(), &w, &live, card, "doMenu", vec![Dynamic::from(item.clone()), Dynamic::from(menu_name)])? { return Ok(()); }
+            let key = item.to_lowercase().replace("...", "…");
+            let script = match key.as_str() {
+                "first" | "prev" | "previous" | "next" | "last" | "back" => format!("go {key};"),
+                "new card" => "new card;".into(),
+                "delete card" => "delete this card;".into(),
+                "find…" | "find" => "ask \"Find:\"; if it != \"\" { find it; }".into(),
+                "new stack…" | "new stack" => "ask \"Name of the new stack:\"; if it != \"\" { create stack it; go to stack it in a new window; }".into(),
+                "undo" => { w.borrow_mut().undo_request = true; return Ok(()); }
+                "message" => { let mut wb = w.borrow_mut(); wb.message_visible = true; wb.message_request = true; return Ok(()); }
+                "quit hypercard" | "quit" => { dispatch(ctx.engine(), &w, &live, card, "quit", vec![])?; w.borrow_mut().quit_request = true; return Ok(()); }
+                k if TOOLS.contains(&k) => format!("choose {k} tool;"),
+                _ if found.is_some() => return Ok(()),
+                _ => return Err(err(&format!("doMenu: no menu item \"{item}\""))),
+            };
+            let ast = ctx.engine().compile(&hypertalk_words(&hypertalk_blocks(&script)))?;
+            let _ = ctx.engine().eval_ast_with_scope::<Dynamic>(&mut Scope::new(), &ast)?;
+            Ok(())
+        };
+        if args == 1 { let f = f.clone(); e.register_fn("__doMenu", move |ctx: rhai::NativeCallContext, item: Dynamic| f(ctx, item.to_string(), String::new())); }
+        else { e.register_fn("__doMenu", move |ctx: rhai::NativeCallContext, item: Dynamic, menu: Dynamic| f(ctx, item.to_string(), menu.to_string())); }
+    }
+
     // visual [effect] <name> [direction] [very slow|slow|fast|very fast] [to black|white|gray|inverse|card]:
     // the effect for the next `go` in this handler run.
     { let w = w.clone();
@@ -1397,6 +1598,8 @@ fn build_engine(w: &W, live: &L) -> Engine {
                     ("prev", _) | ("previous", _) => cards.get((pos + n - 1) % n).copied(),
                     ("first", _) => cards.first().copied(),
                     ("last", _) => cards.last().copied(),
+                    // The card before this one in the recent list (go back walks back through it).
+                    ("back", _) => { drop(cards); let mut found = None; drop(wb); let mut wb = w.borrow_mut(); while let Some(c) = wb.recent.pop() { if wb.obj(c).is_some() && c != wb.current_card() { found = Some(c); break; } } found }
                     ("to", Some(Value::Int(i))) => cards.get((i as usize).wrapping_sub(1)).copied(),
                     ("to", Some(v)) => { let name = v.text().to_lowercase(); cards.iter().copied().find(|c| wb.obj(*c).map(|o| o.name.to_lowercase() == name).unwrap_or(false)) }
                     _ => return Err(err("go where? use next, prev, first, last, card <name> or stack <name>")),
@@ -1412,6 +1615,8 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 if !st.effect.is_empty() { w.borrow_mut().set_effect(&st.effect.join("-")); }
                 else if let Some(v) = pending { w.borrow_mut().set_effect(&v); }
                 navigate(ctx.engine(), &w, &live, target)?;
+                // Going back does not add to the recent list.
+                if how == "back" { w.borrow_mut().recent.pop(); }
             }
             Ok(Dynamic::UNIT)
         });
@@ -1444,6 +1649,11 @@ fn build_engine(w: &W, live: &L) -> Engine {
             }
             let last = syms.last().map(|s| s.as_str()).unwrap_or("");
             let after_text = syms.len() == 2 && !matches!(syms[1].as_str(), "normal" | "whole" | "word" | "chars" | "string") || syms.len() == 3;
+            // … of marked cards: search only the marked cards.
+            if last == "of" { return Ok(Some("marked".into())); }
+            if last == "marked" { return Ok(Some("cards".into())); }
+            if last == "cards" { return Ok(None); }
+            if look == "of" && (after_text || syms.len() >= 2 && syms[syms.len() - 2] == "field") { *state = Dynamic::from(format!("{} marked", state)); return Ok(Some("of".into())); }
             Ok(match last {
                 "normal" | "whole" | "word" | "chars" | "string" if syms.len() == 2 => Some(if look.starts_with('"') { "$string$".into() } else { "$expr$".into() }),
                 _ if after_text && !syms.iter().any(|s| s == "in") => if look == "in" { Some("in".into()) } else { None },
@@ -1453,7 +1663,9 @@ fn build_engine(w: &W, live: &L) -> Engine {
             })
         }, false,
         move |ctx, inputs, state| {
-            let form = state.to_string();
+            let flags = state.to_string();
+            let marked_only = flags.ends_with(" marked");
+            let form = flags.trim_end_matches(" marked").to_string();
             let needle = ctx.eval_expression_tree(&inputs[0])?.to_string();
             let only = if inputs.len() > 1 { let k = ctx.eval_expression_tree(&inputs[1])?; Some(from_dyn(&k).text().to_lowercase()) } else { None };
             let from = me(&w, &live);
@@ -1462,7 +1674,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 let wb = w.borrow();
                 let cards = wb.cards();
                 let pos = cards.iter().position(|c| *c == wb.current_card()).unwrap_or(0);
-                (1..=cards.len()).map(|k| cards[(pos + k) % cards.len()]).find_map(|c| {
+                (1..=cards.len()).map(|k| cards[(pos + k) % cards.len()]).filter(|c| !marked_only || wb.get(*c, "marked").truthy()).find_map(|c| {
                     card_texts(&wb, c).into_iter()
                         // Shared-text fields read the same on every card, so they cannot tell cards apart; dontSearch opts out.
                         .filter(|(f, _)| only.is_some() || !(wb.get(*f, "sharedText").truthy() || wb.get(*f, "dontSearch").truthy()))
@@ -1738,6 +1950,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 p[0] >= r[0] && p[0] < r[0] + r[2] && p[1] >= r[1] && p[1] < r[1] + r[3]
             })
         };
+        if is_paint_tool(&w.borrow().tool) { let mut wb = w.borrow_mut(); let card = wb.current_card(); add_stroke(&mut wb, card, &[(p[0], p[1])]); return Ok(Dynamic::UNIT); }
         let target = hit.unwrap_or_else(|| w.borrow().current_card());
         w.borrow_mut().click_loc = (p[0], p[1]);
         dispatch(ctx.engine(), &w, &live, target, "mouseDown", vec![])?;
@@ -1779,6 +1992,30 @@ fn build_engine(w: &W, live: &L) -> Engine {
             })
         }, false,
         move |ctx, inputs, state| {
+            if state.to_string() == "menu" {
+                let name = ctx.eval_expression_tree(inputs.first().ok_or_else(|| err("create menu needs a name"))?)?.to_string();
+                let mut wb = w.borrow_mut();
+                if wb.menus.iter().any(|m| m.name.eq_ignore_ascii_case(&name)) { return Err(err(&format!("there is already a menu \"{name}\""))); }
+                wb.menus.push(Menu { name, items: vec![] });
+                return Ok(Dynamic::UNIT);
+            }
+            if state.to_string() == "stack" {
+                // create stack "<name>": a new stack file, one card on one background, in this stack's folder.
+                let name = ctx.eval_expression_tree(inputs.first().ok_or_else(|| err("create stack needs a name"))?)?.to_string();
+                let name = name.trim().trim_end_matches(".stack").to_string();
+                let (width, height, path) = { let wb = w.borrow(); (wb.file.width, wb.file.height, wb.path(&format!("{name}.stack"))) };
+                if w.borrow().fs.borrow().is_file(&path) { return Err(err(&format!("there is already a stack \"{name}\""))); }
+                let mut nw = World::new(StackFile::new(&name, width, height));
+                let st = nw.create(Kind::Stack, &name, None, None);
+                let bg = nw.create(Kind::Background, "background 1", Some(st), None);
+                let card = nw.create(Kind::Card, "card 1", Some(bg), None);
+                nw.file.current_card = card;
+                nw.file.journal.clear();
+                let fs = w.borrow().fs.clone();
+                fs.borrow_mut().write_bytes(&path, &nw.file.to_zip()).map_err(|e| err(&e))?;
+                w.borrow_mut().result.clear();
+                return Ok(Dynamic::UNIT);
+            }
             if state.to_string() == "folder" {
                 let p = ctx.eval_expression_tree(inputs.first().ok_or_else(|| err("create folder needs a path"))?)?.to_string();
                 let wb = w.borrow();
@@ -1786,7 +2023,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 wb.fs.borrow_mut().create_folder(&p).map_err(|e| err(&e))?;
                 return Ok(Dynamic::UNIT);
             }
-            let kind = match state.to_string().as_str() { "button" => Kind::Button, "field" => Kind::Field, k => return Err(err(&format!("create what? create button, field or folder, not {k}"))) };
+            let kind = match state.to_string().as_str() { "button" => Kind::Button, "field" => Kind::Field, k => return Err(err(&format!("create what? create button, field, menu, stack or folder, not {k}"))) };
             let name = if inputs.is_empty() { None } else { Some(ctx.eval_expression_tree(&inputs[0])?.to_string()) };
             let id = {
                 let mut wb = w.borrow_mut();
@@ -1958,6 +2195,10 @@ fn build_engine(w: &W, live: &L) -> Engine {
         |syms: &[ImmutableString], look: &str, state: &mut Dynamic| {
             let mut st = if syms.len() == 1 { DelSt::default() } else { state.clone_cast::<DelSt>() };
             let next: Option<ImmutableString> = match st.phase {
+                0 if look == "this" => { st.what = "card".into(); st.phase = 30; Some("this".into()) }
+                30 => { st.phase = 10; Some("card".into()) }
+                0 if look == "card" => { st.what = "card".into(); st.phase = 31; Some("card".into()) }
+                31 => if look.starts_with('"') || look.starts_with('(') || look.chars().next().is_some_and(|c| c.is_ascii_digit()) { st.phase = 10; Some(slot(look)) } else { None },
                 0 => { st.what = look.into(); st.phase = if matches!(look, "file" | "folder") { 9 } else { 1 }; Some(look.into()) }
                 9 => { st.phase = 10; Some(slot(look)) }
                 1 => { st.phase = 2; Some("$expr$".into()) }
@@ -1971,6 +2212,20 @@ fn build_engine(w: &W, live: &L) -> Engine {
         }, true,
         move |ctx, inputs, state| {
             let st = state.clone_cast::<DelSt>();
+            if st.what == "card" {
+                // delete [this] card [<name>]: deleteCard goes to it, then the next card shows.
+                let key = if inputs.is_empty() { None } else { Some(ctx.eval_expression_tree(&inputs[0])?) };
+                let card = resolve(&w, &live, "card", key.as_ref())?;
+                let (n, here) = { let wb = w.borrow(); (wb.cards().len(), wb.current_card()) };
+                if n <= 1 { return Err(err("can't delete the last card")); }
+                dispatch(ctx.engine(), &w, &live, card, "deleteCard", vec![])?;
+                if card == here {
+                    let next = { let wb = w.borrow(); let cards = wb.cards(); let i = cards.iter().position(|c| *c == card).unwrap_or(0); cards[(i + 1) % cards.len()] };
+                    navigate(ctx.engine(), &w, &live, next)?;
+                }
+                w.borrow_mut().delete(card);
+                return Ok(Dynamic::UNIT);
+            }
             if st.what == "file" || st.what == "folder" {
                 let p = { let wb = w.borrow(); wb.path(&ctx.eval_expression_tree(&inputs[0])?.to_string()) };
                 let fs = w.borrow().fs.clone();
@@ -2356,6 +2611,19 @@ impl Rt {
         self.send(f, "mouseUp")
     }
 
+    /// The user chose a menu item in the player's menu bar.
+    pub fn do_menu(&self, item: &str, menu: &str) { self.exec(&format!("doMenu {item:?}, {menu:?};")); }
+
+    /// The user painted a stroke with the current paint tool (points in card coordinates).
+    pub fn paint(&self, pts: &[(f64, f64)]) {
+        if self.is_paused() || pts.is_empty() { return; }
+        let mut wb = self.w.borrow_mut();
+        if !is_paint_tool(&wb.tool) || wb.user_level < 3 { return; }
+        wb.begin();
+        let card = wb.current_card();
+        add_stroke(&mut wb, card, pts);
+    }
+
     /// Whether a script is paused (the stack is modal until it finishes).
     pub fn is_paused(&self) -> bool { self.paused.borrow().is_some() }
 
@@ -2475,7 +2743,7 @@ impl Rt {
         let Some(p) = self.paused.borrow_mut().take() else { return };
         {
             let wb = self.w.borrow();
-            self.live.borrow_mut().settle = Some(Settle { sounds: wb.sound_cmds.len(), urls: wb.url_requests.len(), go: wb.go_stack.clone(), edit: wb.edit_request });
+            self.live.borrow_mut().settle = Some(Settle { sounds: wb.sound_cmds.len(), urls: wb.url_requests.len(), go: wb.go_stack.clone(), edit: wb.edit_request, requests: (wb.undo_request, wb.message_request, wb.quit_request) });
         }
         self.live.borrow_mut().waiting = None;
         self.restore(p.snap);
@@ -2489,7 +2757,8 @@ impl Rt {
             log_len: wb.log.len(), result: wb.result.clone(), item_delim: wb.item_delim.clone(), timers: wb.timers.clone(),
             push_list: wb.push_list.clone(), selection: wb.selection, focused: wb.focused, user_level: wb.user_level,
             open_files: wb.open_files.clone(), effect: wb.effect.clone(), effect_seq: wb.effect_seq, sound: wb.sound.clone(),
-            draw: wb.draw.clone(), mouse_click: wb.mouse_click, click_loc: wb.click_loc, libs: wb.libs.clone(), visited: wb.visited.clone(),
+            draw: wb.draw.clone(), mouse_click: wb.mouse_click, click_loc: wb.click_loc, libs: wb.libs.clone(), visited: wb.visited.clone(), tool: wb.tool.clone(), line_size: wb.line_size, filled: wb.filled,
+            menus: wb.menus.clone(), recent: wb.recent.clone(), lock_recent: wb.lock_recent,
             globals: self.live.borrow().globals.clone(), seed: rand_seed(),
         }
     }
@@ -2502,7 +2771,8 @@ impl Rt {
             wb.log.truncate(s.log_len); wb.result = s.result; wb.item_delim = s.item_delim; wb.timers = s.timers;
             wb.push_list = s.push_list; wb.selection = s.selection; wb.focused = s.focused; wb.user_level = s.user_level;
             wb.open_files = s.open_files; wb.effect = s.effect; wb.effect_seq = s.effect_seq; wb.sound = s.sound;
-            wb.draw = s.draw; wb.mouse_click = s.mouse_click; wb.click_loc = s.click_loc; wb.libs = s.libs; wb.visited = s.visited;
+            wb.draw = s.draw; wb.mouse_click = s.mouse_click; wb.click_loc = s.click_loc; wb.libs = s.libs; wb.visited = s.visited; wb.tool = s.tool; wb.line_size = s.line_size; wb.filled = s.filled;
+            wb.menus = s.menus; wb.recent = s.recent; wb.lock_recent = s.lock_recent;
             wb.dialog = None; wb.dialog_buttons.clear(); wb.dialog_ask = None; wb.dialog_file = None;
             ids
         };
@@ -3060,6 +3330,29 @@ fn other_stack(w: &W, name: &str) -> R<u32> {
     Ok(id)
 }
 
+/// The topmost visible part of these kinds at a point on the current card.
+fn part_at(wb: &World, p: (f64, f64), kinds: &[Kind]) -> Option<u32> {
+    wb.parts_on(wb.current_card()).into_iter().rev().find(|id| {
+        let Some(o) = wb.obj(*id) else { return false };
+        if !kinds.contains(&o.kind) || !wb.get(*id, "visible").truthy() { return false; }
+        let r = ["left", "top", "width", "height"].map(|k| wb.get(*id, k).int() as f64);
+        p.0 >= r[0] && p.0 < r[0] + r[2] && p.1 >= r[1] && p.1 < r[1] + r[3]
+    })
+}
+
+fn is_paint_tool(t: &str) -> bool { !matches!(t, "browse" | "button" | "field") }
+
+/// Paint on a card: one line of its `paint` property per stroke, "<tool> <lineSize> <filled> h,v h,v …".
+/// Journaled, so Undo takes a stroke back.
+fn add_stroke(wb: &mut World, card: u32, pts: &[(f64, f64)]) {
+    if pts.is_empty() { return; }
+    let line = format!("{} {} {} {}", wb.tool.replace(' ', "_"), wb.line_size, if wb.filled { 1 } else { 0 },
+        pts.iter().map(|(x, y)| format!("{},{}", x.round() as i64, y.round() as i64)).collect::<Vec<_>>().join(" "));
+    let old = wb.get(card, "paint").text();
+    let new = if old.is_empty() { line } else { format!("{old}\n{line}") };
+    wb.set(card, "paint", Value::Str(new), false);
+}
+
 fn compile_into(engine: &Engine, live: &L, id: u32, src: &str) {
     let mut lb = live.borrow_mut();
     if src.trim().is_empty() { lb.asts.remove(&id); lb.errors.remove(&id); return; }
@@ -3226,9 +3519,8 @@ pub fn hypertalk_blocks(src: &str) -> String {
             let one = t.strip_suffix(';').filter(|b| !b.contains(';') && !b.contains('{') && !b.contains('}'));
             let line = match one.and_then(rewrite_statement) {
                 Some(c) if !was_continued => c,
-                // Several statements on one line: a `sort … of <container>` among them is still rewritten.
-                _ if !was_continued && t.to_lowercase().contains("sort ") && !t.contains('{') && !t.contains('}') =>
-                    split_statements(&t).into_iter().map(|st| sort_container(&st).unwrap_or_else(|| format!("{};", st.trim()))).collect::<Vec<_>>().join(" "),
+                // Several statements on one line: `sort … of <container>` and menu statements among them are still rewritten.
+                _ if !was_continued => several_statements(&t).unwrap_or_else(|| t.clone()),
                 _ => t.clone(),
             };
             push(&mut out, line);
@@ -3297,7 +3589,7 @@ pub fn hypertalk_blocks(src: &str) -> String {
                 if rest.is_empty() { "repeat {".to_string() } else { format!("repeat {rest} {{") }
             }
             // The rest of a continued line (`¬`) is never a command of its own.
-            _ => match (!was_continued).then(|| rewrite_statement(&t)).flatten() { Some(c) => c, None => stmt(&t) },
+            _ => match (!was_continued).then(|| rewrite_statement(&t).or_else(|| several_statements(&t))).flatten() { Some(c) => c, None => stmt(&t) },
         };
         push(&mut out, line);
     }
@@ -3328,7 +3620,7 @@ const KNOWN_STATEMENT_WORDS: &[&str] = &[
     "let", "const", "if", "else", "while", "loop", "for", "do", "return", "break", "continue", "fn", "switch", "throw", "try", "catch",
     "import", "export", "private", "print", "debug", "true", "false", "this",
     // this language
-    "on", "function", "end", "pass", "exit", "next", "repeat", "global", "put", "get", "set", "go", "answer", "ask", "wait", "visual", "find", "beep",
+    "on", "function", "end", "pass", "exit", "next", "repeat", "global", "put", "get", "set", "go", "answer", "ask", "wait", "visual", "choose", "drag", "reset", "menu", "find", "beep",
     "send", "new", "hide", "show", "enable", "disable", "mark", "unmark", "play", "lock", "unlock", "with", "add", "subtract",
     "multiply", "divide", "do", "sort", "push", "pop", "edit", "select", "click", "type", "create", "convert", "file", "open", "close",
     "read", "write", "delete", "rename", "load", "url", "start", "stop", "there", "the", "me", "it", "target", "field", "button",
@@ -3338,7 +3630,49 @@ const KNOWN_STATEMENT_WORDS: &[&str] = &[
 ];
 
 /// Statements rewritten before compiling: sorting a container, and user commands.
-fn rewrite_statement(line: &str) -> Option<String> { sort_container(line).or_else(|| user_command(line)) }
+fn rewrite_statement(line: &str) -> Option<String> { sort_container(line).or_else(|| menu_statement(line)).or_else(|| user_command(line)) }
+
+/// Menu statements, as calls:
+/// `doMenu "Next" [, "Go"]`, `reset menuBar`, `delete menu X`, `delete|enable|disable menuItem X of menu Y`,
+/// `enable|disable menu X`, `put V into|after|before menu X [with menuMessage[s] M]`.
+fn menu_statement(line: &str) -> Option<String> {
+    let t = line.trim().trim_end_matches(';').trim_end();
+    let words = top_words(t);
+    let w = |i: usize| words.get(i).map(|&(a, b)| t[a..b].to_lowercase()).unwrap_or_default();
+    let from = |i: usize| words.get(i).map(|&(a, _)| t[a..].trim()).unwrap_or("");
+    let span = |i: usize, j: usize| if i < j && j <= words.len() { t[words[i].0..words[j - 1].1].trim() } else { "" };
+    let item_of_menu = |op: &str| -> Option<String> {
+        let k = (2..words.len()).find(|&k| matches!(w(k).as_str(), "of" | "from") && w(k + 1) == "menu")?;
+        Some(format!("__menuItem(\"{op}\", {}, {});", span(2, k), from(k + 2)))
+    };
+    match (w(0).as_str(), w(1).as_str()) {
+        ("domenu", _) if words.len() > 1 => Some(format!("__doMenu({});", from(1))),
+        ("reset", "menubar") if words.len() == 2 => Some("__menuReset();".into()),
+        ("hide" | "show", "message" | "msg") if words.len() <= 3 && matches!(w(2).as_str(), "" | "box" | "window") => Some(format!("__messageBox({});", w(0) == "show")),
+        ("delete", "menu") if words.len() > 2 => Some(format!("__menuDelete({});", from(2))),
+        ("delete", "menuitem") => item_of_menu("delete"),
+        ("enable" | "disable", "menuitem") => item_of_menu(&w(0)),
+        ("enable" | "disable", "menu") if words.len() > 2 => Some(format!("__menuItem(\"{}\", \"\", {});", w(0), from(2))),
+        ("put", _) => {
+            let k = (2..words.len()).find(|&k| matches!(w(k).as_str(), "into" | "after" | "before") && w(k + 1) == "menu")?;
+            let how = w(k);
+            let m = (k + 2..words.len()).find(|&m| w(m) == "with" && w(m + 1).starts_with("menumessage"));
+            let (name, msgs) = match m { Some(m) => (span(k + 2, m), from(m + 2)), None => (from(k + 2), "\"\"") };
+            Some(format!("__menuPut({}, \"{how}\", {name}, {msgs});", span(1, k)))
+        }
+        _ => None,
+    }
+}
+
+/// A line holding several statements (`a; b; c`) where some need rewriting (`sort … of`, menus):
+/// each is rewritten on its own. None if there is nothing to rewrite.
+fn several_statements(t: &str) -> Option<String> {
+    if t.contains('{') || t.contains('}') { return None; }
+    let parts = split_statements(t);
+    if parts.len() < 2 && !t.trim_end().ends_with(';') { return None; }
+    if !parts.iter().any(|st| sort_container(st).or_else(|| menu_statement(st)).is_some()) { return None; }
+    Some(parts.into_iter().map(|st| sort_container(&st).or_else(|| menu_statement(&st)).unwrap_or_else(|| format!("{};", st.trim()))).collect::<Vec<_>>().join(" "))
+}
 
 /// Split a line at the `;` outside quotes and brackets (empty pieces dropped).
 fn split_statements(t: &str) -> Vec<String> {

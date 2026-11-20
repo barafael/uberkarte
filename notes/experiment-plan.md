@@ -1117,3 +1117,79 @@ wait:
 - the painting user level;
 - `moveWindow`;
 - `quit`.
+
+### The rest of the vocabulary: menus, tools, painting, drag, environment (2026-11-20)
+
+**Menus:**
+- A menu bar with File, Edit, Go and Tools.
+- `create menu`, `put … into|after|before menu … [with menuMessages …]`,
+  `delete menu`, `delete|enable|disable menuItem … of menu …`,
+  `reset menuBar`, `menu "X"` (its items), `the menus`, `there is a menu`.
+- Choosing an item, or `doMenu item [, menu]`, works as in HyperCard:
+  - an item's menuMessage is sent if it has one;
+  - otherwise `doMenu` goes to the current card;
+  - when no handler takes it, the built-in action runs (go First/Prev/Next/
+    Last/Back, New/Delete Card, Undo, Find…, Message, New Stack…, Quit
+    HyperCard, and the tools).
+- The menu statements are rewritten into calls before compiling, as `sort` is.
+  A line holding several statements gets each rewritten.
+
+**Tools and painting:**
+- `choose <name> tool`, `choose tool N` (HyperCard's 18) and `the tool`.
+- The button and field tools are the player's Edit mode; the mode and the tool
+  follow each other.
+- **Paint tools (userLevel 3):**
+  - pencil, brush, eraser, spray, line, curve, rectangle, round rect, oval,
+    regular polygon and polygon;
+  - `set the lineSize`, `set the filled`, `reset paint`.
+- Strokes are stored on the card as its `paint` property, one line per stroke,
+  so they are journaled, undoable and saved.
+- The player draws them as SVG behind the parts. With a paint tool chosen
+  (menu or the Tool picker), dragging on the card paints.
+- select, lasso, bucket and text don't paint.
+
+**`drag from … to … [with shiftKey…]`:**
+- browse tool: mouseDown, mouseStillDown along the way, then mouseUp if the
+  drag ends inside;
+- button or field tool: moves the part;
+- paint tool: paints.
+
+**Smaller additions:**
+- `find … of marked cards`.
+- `delete [this] card`, with deleteCard.
+- `go back` and `lockRecent`.
+- `create stack "x"`: a new stack file in this stack's folder. On the web it
+  lasts for the session, and the web player can open it.
+- `put x` with no destination shows x in the message box.
+- `hide`/`show message box`.
+- The environment: `the windows`, `the screenRect`, `the systemVersion`, and
+  `the diskSpace`/`heapSpace`/`stackSpace`. The last three report plenty of
+  room; they are not measured.
+
+**Player messages:**
+- `functionKey` (F1–F15);
+- `suspend`/`resume` when the page is hidden and shown again;
+- `sizeWindow` and `moveWindow`;
+- `quit` (File > Quit HyperCard saves, then closes the desktop window, or shows
+  "has quit" on the web).
+
+**Operator precedence** checked against HyperTalk's table: `^` evaluates left
+to right, and unary minus binds tighter than `^`.
+
+**Checks:**
+- **path.rs:** 45 tests pass.
+- **Keywords:** 146 of 149 clean (98%). The two n/a rows are Apple events and
+  blind typing; `obj_window` is partial (no window objects with properties).
+- **Web player, in headless Chromium:**
+  - the menu bar, Go > Next, a script's own menu;
+  - painting an oval by dragging, plus a scripted pencil drag;
+  - Edit > Undo;
+  - `choose` switching the mode;
+  - F5 → `functionKey`, `resume`, `sizeWindow`;
+  - hiding the message box and showing it with Go > Message;
+  - File > Quit;
+  - the Self Test (29/29) and the pause checks still pass.
+- Not checked: `moveWindow`, since a headless window doesn't move.
+
+**Known difference:** card paint sits behind all parts. In HyperCard it lies
+above the background's parts.

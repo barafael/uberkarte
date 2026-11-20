@@ -6,6 +6,8 @@ pub trait Fs {
     fn read(&self, path: &str) -> Result<String, String>;
     fn read_bytes(&self, path: &str) -> Result<Vec<u8>, String>;
     fn write(&mut self, path: &str, text: &str) -> Result<(), String>;
+    /// Binary files (a new stack). On the web they last for the session only.
+    fn write_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<(), String>;
     fn delete(&mut self, path: &str) -> Result<(), String>;
     fn rename(&mut self, from: &str, to: &str) -> Result<(), String>;
     fn create_folder(&mut self, path: &str) -> Result<(), String>;
@@ -38,6 +40,7 @@ pub fn resolve_path(base: &str, path: &str) -> String {
 #[derive(Default)]
 pub struct MemFs {
     files: BTreeMap<String, String>,
+    binaries: BTreeMap<String, Vec<u8>>,
     folders: std::collections::BTreeSet<String>,
     changes: Vec<(String, String, String)>,
 }
@@ -60,7 +63,18 @@ impl MemFs {
 
 impl Fs for MemFs {
     fn read(&self, path: &str) -> Result<String, String> { self.files.get(&Self::key(path)).cloned().ok_or_else(|| format!("no file \"{path}\"")) }
-    fn read_bytes(&self, path: &str) -> Result<Vec<u8>, String> { self.read(path).map(|s| s.into_bytes()) }
+    fn read_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        if let Some(b) = self.binaries.get(&Self::key(path)) { return Ok(b.clone()); }
+        self.read(path).map(|s| s.into_bytes())
+    }
+    fn write_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        let k = Self::key(path);
+        if self.folders.contains(&k) { return Err(format!("\"{path}\" is a folder")); }
+        self.add_parents(&k);
+        self.files.remove(&k);
+        self.binaries.insert(k, bytes.to_vec());
+        Ok(())
+    }
     fn write(&mut self, path: &str, text: &str) -> Result<(), String> {
         let k = Self::key(path);
         if self.folders.contains(&k) { return Err(format!("\"{path}\" is a folder")); }
@@ -92,14 +106,15 @@ impl Fs for MemFs {
         self.changes.push(("folder".into(), k, String::new()));
         Ok(())
     }
-    fn is_file(&self, path: &str) -> bool { self.files.contains_key(&Self::key(path)) }
+    fn is_file(&self, path: &str) -> bool { let k = Self::key(path); self.files.contains_key(&k) || self.binaries.contains_key(&k) }
     fn is_folder(&self, path: &str) -> bool { let k = Self::key(path); k == "/" || self.folders.contains(&k) }
     fn list(&self, path: &str) -> Result<(Vec<String>, Vec<String>), String> {
         let k = Self::key(path);
         if !self.is_folder(&k) { return Err(format!("no folder \"{path}\"")); }
         let prefix = if k == "/" { "/".to_string() } else { format!("{k}/") };
         let direct = |p: &String| p.starts_with(&prefix) && !p[prefix.len()..].contains('/');
-        let files = self.files.keys().filter(|p| direct(p)).map(|p| p[prefix.len()..].to_string()).collect();
+        let mut files: Vec<String> = self.files.keys().chain(self.binaries.keys()).filter(|p| direct(p)).map(|p| p[prefix.len()..].to_string()).collect();
+        files.sort();
         let folders = self.folders.iter().filter(|p| direct(p) && p.len() > prefix.len()).map(|p| p[prefix.len()..].to_string()).collect();
         Ok((files, folders))
     }
@@ -138,6 +153,11 @@ impl Fs for NativeFs {
     fn delete(&mut self, path: &str) -> Result<(), String> {
         let p = Self::p(path);
         if p.is_dir() { std::fs::remove_dir(p) } else { std::fs::remove_file(p) }.map_err(|e| format!("{path}: {e}"))
+    }
+    fn write_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        let p = Self::p(path);
+        if let Some(d) = p.parent() { if !d.as_os_str().is_empty() { std::fs::create_dir_all(d).map_err(|e| format!("{path}: {e}"))?; } }
+        std::fs::write(p, bytes).map_err(|e| format!("{path}: {e}"))
     }
     fn rename(&mut self, from: &str, to: &str) -> Result<(), String> {
         if Self::p(to).exists() { return Err(format!("\"{to}\" already exists")); }

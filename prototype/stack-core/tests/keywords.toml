@@ -20,15 +20,16 @@ test = "answer_and_ask_wait_for_the_reply_in_it"
 
 [[kw]]
 id = "cmd_choose"
-cls = "na"
-note = "tools are edit/browse modes of the player, not script-selectable"
-
+cls = "clean"
+ours = "set the userLevel to 5; choose button tool; choose tool 6; choose round rect tool; choose browse tool;"
+test = "tools_drag_and_paint"
+note = "button and field tools are the player's Edit mode; select, lasso, bucket and text tools are not available for painting"
 [[kw]]
 id = "cmd_clickdrag"
-cls = "partial"
-ours = "click at \"370,70\"; select after text of field \"notes\"; type \"!\";"
-note = "click at and type; no drag"
-
+cls = "clean"
+ours = "click at \"370,70\"; drag from \"10,10\" to \"60,40\" with shiftKey;"
+test = "tools_drag_and_paint"
+note = "drag with the browse tool sends mouseDown, mouseStillDown, mouseUp; with the button or field tool it moves the part; with a paint tool it paints"
 [[kw]]
 id = "cmd_convert"
 cls = "clean"
@@ -37,10 +38,10 @@ note = "UTC"
 
 [[kw]]
 id = "cmd_create"
-cls = "partial"
-ours = "create button \"Extra\"; create field;"
-note = "buttons, fields, folders; not stacks or menus"
-
+cls = "clean"
+ours = "create button \"Extra\"; create field; create menu \"Colors\"; create folder \"made\";"
+test = "create_stack_find_marked_delete_card_and_environment"
+note = "create stack writes a new stack file in this stack's folder (on the web: for the session)"
 [[kw]]
 id = "cmd_do"
 cls = "clean"
@@ -48,9 +49,10 @@ ours = "do \"put 9 into q\";"
 
 [[kw]]
 id = "cmd_domenu"
-cls = "na"
-note = "no menu bar"
-
+cls = "clean"
+ours = "doMenu \"Next\"; doMenu \"First\", \"Go\";"
+test = "menus_and_domenu"
+note = "File, Edit, Go and Tools menus with built-in items; scripts add their own"
 [[kw]]
 id = "cmd_edit"
 cls = "clean"
@@ -70,10 +72,9 @@ test = "select_nested_chunks_and_exit_to_hypercard"
 
 [[kw]]
 id = "cmd_find"
-cls = "partial"
-ours = "find \"Hop\"; find whole \"first published\"; find word \"Grace\"; find chars \"card\" in field \"notes\"; find string \"ace H\";"
-note = "all five forms and in field; not of marked cards"
-
+cls = "clean"
+ours = "find \"Hop\"; find whole \"first published\"; find word \"Grace\"; find chars \"card\" in field \"notes\"; find string \"ace H\"; find \"Ada\" of marked cards;"
+test = "create_stack_find_marked_delete_card_and_environment"
 [[kw]]
 id = "cmd_get"
 cls = "clean"
@@ -242,9 +243,9 @@ note = "set by go, find, answer/ask (Cancel), start using, url, file commands"
 
 [[kw]]
 id = "fn_tool"
-cls = "na"
-note = "see choose"
-
+cls = "clean"
+ours = "put the tool into t;"
+test = "tools_drag_and_paint"
 [[kw]]
 id = "fn_version"
 cls = "clean"
@@ -252,10 +253,10 @@ ours = "put the version into v;"
 
 [[kw]]
 id = "fn_env"
-cls = "partial"
-ours = "put the stacks & the stacksInUse into s;"
-note = "the stacks (open tabs), the stacksInUse; no windows, menus, diskSpace"
-
+cls = "clean"
+ours = "put the stacks & the stacksInUse & the windows & the menus & the screenRect & the diskSpace & the systemVersion into s;"
+test = "create_stack_find_marked_delete_card_and_environment"
+note = "diskSpace, heapSpace and stackSpace report plenty of room; they are not measured"
 [[kw]]
 id = "fn_click"
 cls = "clean"
@@ -407,12 +408,15 @@ ours = "put the name of part 1 & the name of part \"Hello\" into n;"
 
 [[kw]]
 id = "obj_window"
-cls = "na"
-
+cls = "partial"
+ours = "put the windows into w; hide message box; show message box;"
+test = "hypertalk_precedence_and_put_to_the_message_box"
+note = "the card window and the message box; no window objects with properties"
 [[kw]]
 id = "obj_menu"
-cls = "na"
-
+cls = "clean"
+ours = "create menu \"M\"; put \"A,B\" into menu \"M\" with menuMessages \"a,b\"; disable menuItem \"B\" of menu \"M\"; put menu \"M\" into x; delete menu \"M\";"
+test = "menus_and_domenu"
 [[kw]]
 id = "obj_id"
 cls = "clean"
@@ -484,10 +488,9 @@ note = "and, or, not with HyperTalk precedence (not binds tightest)"
 
 [[kw]]
 id = "op_precedence"
-cls = "partial"
-ours = "put 2 + 3 * 4 into n; if \"a\" & \"b\" = \"ab\" and not false { put 1 into x; }"
-note = "HyperTalk order for & && and not; the rest is Rhai's table (very close: ^ * / + - comparisons and or)"
-
+cls = "clean"
+ours = "put 2 + 3 * 4 into n; if \"a\" & \"b\" = \"ab\" and not false { put 1 into x; } put 2 ^ 3 ^ 2 into y;"
+test = "hypertalk_precedence_and_put_to_the_message_box"
 [[kw]]
 id = "con_empty"
 cls = "clean"
@@ -527,12 +530,14 @@ test = "vocabulary_batch"
 
 [[kw]]
 id = "msg_quit"
-cls = "missing"
-
+cls = "clean"
+test = "menus_and_domenu"
+note = "File > Quit HyperCard (or doMenu) sends quit, saves, and closes the player"
 [[kw]]
 id = "msg_suspend"
-cls = "na"
-
+cls = "clean"
+ours = "set the script of this card to \"on suspend\" & return & \"end suspend\";"
+note = "suspend / resume when the player is hidden and shown again; suspendStack / resumeStack between tabs (checked in the browser)"
 [[kw]]
 id = "msg_idle"
 cls = "clean"
@@ -583,8 +588,9 @@ test = "vocabulary_batch"
 
 [[kw]]
 id = "msg_functionkey"
-cls = "na"
-
+cls = "clean"
+ours = "set the script of this card to \"on functionKey n\" & return & \"put n into field 1\" & return & \"end functionKey\";"
+note = "the player sends functionKey 1 to 15 for F1 to F15 (checked in the browser)"
 [[kw]]
 id = "msg_commandkeydown"
 cls = "clean"
@@ -605,8 +611,9 @@ test = "player_message_names"
 
 [[kw]]
 id = "msg_domenu"
-cls = "na"
-
+cls = "clean"
+test = "menus_and_domenu"
+note = "sent to the current card when a menu item is chosen"
 [[kw]]
 id = "msg_go"
 cls = "clean"
@@ -752,10 +759,9 @@ ours = "put the number of card into n; put the number of button \"Hello\" into m
 
 [[kw]]
 id = "prop_icon"
-cls = "partial"
-ours = "set the icon of button \"Hello\" to \"glow\";"
-note = "names a picture in the stack, not an icon number"
-
+cls = "clean"
+ours = "set the icon of button \"Hello\" to \"glow\"; set the icon of button \"Hello\" to 0;"
+note = "an icon is a picture in the stack, by name; HyperCard's icon numbers work when a picture is named by its number; 0 is none"
 [[kw]]
 id = "prop_lockscreen"
 cls = "clean"
@@ -768,9 +774,10 @@ ours = "set the lockMessages to true; go next;"
 
 [[kw]]
 id = "prop_lockrecent"
-cls = "na"
-note = "no Recent list"
-
+cls = "clean"
+ours = "set lockRecent to true; go next; set lockRecent to false; go back;"
+test = "create_stack_find_marked_delete_card_and_environment"
+note = "go back walks back through the cards visited"
 [[kw]]
 id = "prop_blindtyping"
 cls = "na"
@@ -782,16 +789,15 @@ ours = "set the itemDelimiter to \"|\"; set the itemDelimiter to \",\";"
 
 [[kw]]
 id = "prop_userlevel"
-cls = "partial"
-ours = "set the userLevel to 4; set the userLevel to 5;"
-note = "1 browse, 2 type, 4 author, 5 script; no painting level (3 acts as 2); kept in Home"
-
+cls = "clean"
+ours = "set the userLevel to 3; choose pencil tool; set the userLevel to 4; set the userLevel to 5;"
+test = "tools_drag_and_paint"
+note = "1 browse, 2 type, 3 paint, 4 author, 5 script; kept in Home"
 [[kw]]
 id = "msg_resize"
-cls = "partial"
-note = "sizeWindow when the player window is resized; no moveWindow"
-test = "player_message_names"
-
+cls = "clean"
+test = "visual_effect_idle_and_autoselect"
+note = "sizeWindow and moveWindow when the player's window is resized or moved (checked in the browser)"
 [[kw]]
 id = "msg_doerror"
 cls = "clean"
