@@ -110,7 +110,9 @@ fn App() -> impl IntoView {
                     </button>
                     {move || result.get().map(|r| view! { <span class="hint">{format!("{:.1} ms", r.ms)}</span> })}
                 </div>
-                {move || result.get().map(|r| view! { <Results result=r as_json=as_json.get() open=open /> })}
+                <div class="results">
+                    {move || result.get().map(|r| view! { <Results result=r as_json=as_json.get() open=open /> })}
+                </div>
             </section>
         </main>
         <footer>

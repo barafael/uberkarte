@@ -292,7 +292,7 @@ fn handle_requests() {
     for (url, to) in urls {
         let target = rt();
         spawn(async move {
-            let js = format!("fetch({url:?}).then(r => r.ok ? r.text() : Promise.reject(r.status + ' ' + r.statusText)).then(t => dioxus.send([true, t])).catch(e => dioxus.send([false, String(e)]))");
+            let js = format!("fetch({url:?}).then(r => r.ok ? r.text() : Promise.reject(r.status + ' ' + r.statusText)).then(t => dioxus.send([true, t])).catch(e => dioxus.send([false, e instanceof TypeError ? String(e) + ' (the site may not allow pages on other sites to read it: a browser rule; the desktop player has no such limit)' : String(e)]))");
             let mut ch = document::eval(&js);
             if let Ok((ok, text)) = ch.recv::<(bool, String)>().await {
                 if ok { target.url_loaded(&url, &text, to); } else { target.w.borrow_mut().log.push(format!("load url {url}: {text}")); target.url_failed(&url, &text, to); }

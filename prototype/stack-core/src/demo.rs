@@ -497,7 +497,7 @@ pub const SELF_TEST_MANUAL: &str = "Manual checks. Click each button and compare
 3  Play notes: you hear four harpsichord notes.\n\
 4  Ask a question: type a name and press OK; it appears below.\n\
 5  Timer: two seconds later, \"timer fired\" appears below.\n\
-6  Fetch a page: the length of example.org appears below. On the web, sites that do not allow cross-origin reads fail with an error instead.\n\
+6  Fetch a page: the length of this project's README appears below. On the web, only sites that allow cross-origin reads work.\n\
 7  Restart the player and open this stack again: the results of the last run are still there (no Save).\n\
 8  Edit: switch to Edit, change the label or script of a button here, switch back to Browse and use it.";
 
@@ -545,7 +545,7 @@ pub fn self_test() -> StackFile {
         ("3 Play notes", "on mouseUp\n  play \"harpsichord\" tempo 160 \"c4q e g c5h\"\nend mouseUp"),
         ("4 Ask a question", "on mouseUp\n  ask \"Your name?\" with \"Ada\"\nend mouseUp\non asked n\n  put return & \"name: \" & n after field \"results\"\nend asked"),
         ("5 Timer", "on mouseUp\n  send \"late\" to me in 2 seconds\nend mouseUp\non late\n  put return & \"timer fired\" after field \"results\"\nend late"),
-        ("6 Fetch a page", "on mouseUp\n  load url \"https://example.org/\"\nend mouseUp\non urlLoaded u, status\n  if status is \"error\" then put return & \"fetch failed: \" & the result after field \"results\"\n  else put return & \"fetched \" & length(url u) & \" characters from \" & u after field \"results\"\nend urlLoaded"),
+        ("6 Fetch a page", "on mouseUp\n  load url \"https://raw.githubusercontent.com/barafael/uberkarte/main/README.md\"\nend mouseUp\non urlLoaded u, status\n  if status is \"error\" then put return & \"fetch failed: \" & the result after field \"results\"\n  else put return & \"fetched \" & length(url u) & \" characters from \" & u after field \"results\"\nend urlLoaded"),
     ];
     for (i, (name, script)) in buttons.iter().enumerate() {
         let id = w.create(Kind::Button, name, Some(man), None);
