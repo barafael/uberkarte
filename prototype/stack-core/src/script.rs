@@ -1,6 +1,6 @@
 //! Script engine: stock Rhai plus English-shaped commands, and the message path.
 //! Path: part -> card -> background -> stack -> built-in. Commands are messages first.
-use crate::model::{canon_prop, default_menus, GoStack, Kind, Menu, MenuItem, Obj, OpenFile, Shape, SoundCmd, StackFile, Value, World, HOME, LIB0, TOOLS, VISIT0};
+use crate::model::{Stroke, canon_prop, default_menus, AssetKind, GoStack, Kind, Menu, MenuItem, Obj, OpenFile, PlayerRequest, Shape, SoundCmd, StackFile, Tool, Value, World, HOME, LIB0, RECENT_MAX, VISIT0};
 use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString, Position, Scope, AST};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -84,7 +84,7 @@ struct ArithSt { field: bool, phase: u8 }
 #[derive(Default)]
 struct Live { asts: HashMap<u32, Rc<AST>>, errors: HashMap<u32, String>, frames: Vec<Frame>,
     /// HyperTalk-style globals: runtime state shared by all handlers, not saved with the stack.
-    globals: HashMap<String, Dynamic>,
+    globals: Rc<HashMap<String, Dynamic>>,
     /// Canvases named by enclosing `with canvas` blocks; drawing goes to the innermost.
     canvas: Vec<u32>,
     /// Variables each handler sets with `put … into <name>`, by object and message. They are
@@ -99,7 +99,7 @@ struct Live { asts: HashMap<u32, Rc<AST>>, errors: HashMap<u32, String>, frames:
     settle: Option<Settle> }
 type L = Rc<RefCell<Live>>;
 
-pub struct Rt { pub engine: Engine, pub w: W, live: L, paused: RefCell<Option<Paused>>, later: RefCell<Vec<Later>> }
+pub struct Rt { pub engine: Engine, pub w: W, live: L, paused: RefCell<Option<Paused>>, later: RefCell<std::collections::VecDeque<Later>> }
 
 // ---- Pausing: answer, ask and wait ------------------------------------------------------------------
 //
@@ -163,7 +163,7 @@ impl Tape {
 }
 
 #[derive(Clone)]
-struct Settle { sounds: usize, urls: usize, go: Option<GoStack>, edit: Option<u32>, requests: (bool, bool, bool) }
+struct Settle { sounds: usize, urls: usize, go: Option<GoStack>, edit: Option<u32>, requests: usize }
 
 /// The run reached live again: drop what it queued for the player a second time.
 fn settle(w: &W, live: &L) {
@@ -173,19 +173,25 @@ fn settle(w: &W, live: &L) {
     wb.url_requests.truncate(s.urls);
     wb.go_stack = s.go;
     wb.edit_request = s.edit;
-    (wb.undo_request, wb.message_request, wb.quit_request) = s.requests;
+    wb.player_requests.truncate(s.requests);
 }
 
-const PAUSED: &str = "\u{2}paused";
-/// `exit to HyperCard`: not catchable either; the run ends quietly.
-const EXIT_ALL: &str = "\u{3}exit";
-fn is_exit_all(e: &EvalAltResult) -> bool { matches!(e, EvalAltResult::ErrorTerminated(v, _) if v.clone().into_string().map(|s| s == EXIT_ALL).unwrap_or(false)) }
-/// Not catchable by `try`: unwinds the whole run.
+/// Why a run stops early. Carried in Rhai's `ErrorTerminated`, which `try` cannot catch, so it unwinds the whole run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Halt {
+    /// A pause point (answer, ask, wait): the run goes on later.
+    Pause,
+    /// `exit to HyperCard`: the run ends quietly.
+    ExitAll,
+}
+fn halt(h: Halt) -> Box<EvalAltResult> { Box::new(EvalAltResult::ErrorTerminated(Dynamic::from(h), Position::NONE)) }
+fn halted(e: &EvalAltResult) -> Option<Halt> { match e { EvalAltResult::ErrorTerminated(v, _) => v.read_lock::<Halt>().map(|h| *h), _ => None } }
+fn is_exit_all(e: &EvalAltResult) -> bool { halted(e) == Some(Halt::ExitAll) }
 fn pause(live: &L, why: Waiting) -> Box<EvalAltResult> {
     live.borrow_mut().waiting = Some(why);
-    Box::new(EvalAltResult::ErrorTerminated(Dynamic::from(PAUSED), Position::NONE))
+    halt(Halt::Pause)
 }
-fn is_pause(e: &EvalAltResult) -> bool { matches!(e, EvalAltResult::ErrorTerminated(v, _) if v.clone().into_string().map(|s| s == PAUSED).unwrap_or(false)) }
+fn is_pause(e: &EvalAltResult) -> bool { halted(e) == Some(Halt::Pause) }
 
 /// A pause point. Running again after the pause, it returns the reply (Some); the first time, None:
 /// the caller shows its dialog (or sets its timer) and returns `pause(…)`.
@@ -237,7 +243,7 @@ impl crate::files::Fs for TapeFs {
     fn is_file(&self, path: &str) -> bool { self.rec(format!("is file {path}"), || self.inner.borrow().is_file(path)) }
     fn is_folder(&self, path: &str) -> bool { self.rec(format!("is folder {path}"), || self.inner.borrow().is_folder(path)) }
     fn list(&self, path: &str) -> Result<(Vec<String>, Vec<String>), String> { self.rec(format!("list {path}"), || self.inner.borrow().list(path)) }
-    fn take_changes(&mut self) -> Vec<(String, String, String)> { self.inner.borrow_mut().take_changes() }
+    fn take_changes(&mut self) -> Vec<crate::files::FsChange> { self.inner.borrow_mut().take_changes() }
     fn preload(&mut self, path: &str, text: Option<&str>) { self.inner.borrow_mut().preload(path, text) }
 }
 
@@ -251,11 +257,33 @@ enum Entry {
 }
 
 /// Runtime state a run may change outside the journal, taken when it starts.
-struct Snap {
-    mark: usize, txn: u64, next_id: u32, current_card: u32, log_len: usize, result: String, item_delim: String,
-    timers: Vec<(f64, u32, String)>, push_list: Vec<u32>, selection: Option<(u32, usize, usize)>, focused: Option<u32>,
-    user_level: i64, open_files: HashMap<String, OpenFile>, effect: Option<String>, effect_seq: u64, sound: Option<String>,
-    draw: HashMap<u32, Vec<Shape>>, mouse_click: bool, click_loc: (f64, f64), libs: Vec<Obj>, visited: Vec<Obj>, tool: String, line_size: i64, filled: bool, menus: Vec<Menu>, recent: Vec<u32>, lock_recent: bool, globals: HashMap<String, Dynamic>, seed: u64,
+/// The runtime state a run may change outside the journal, named once: `Snap` holds a copy, taken when a
+/// run starts and put back when a paused run goes on. The bulky fields are `Rc`s, so a copy is cheap and
+/// only a run that writes one pays for cloning it.
+macro_rules! run_state {
+    ($($f:ident: $t:ty),* $(,)?) => {
+        struct Snap { mark: usize, txn: u64, next_id: u32, current_card: u32, log_len: usize, globals: Rc<HashMap<String, Dynamic>>, seed: u64, $($f: $t),* }
+        fn take_snap(wb: &World, live: &Live) -> Snap {
+            Snap { mark: wb.file.journal.len(), txn: wb.file.txn, next_id: wb.file.next_id, current_card: wb.file.current_card,
+                   log_len: wb.log.len(), globals: live.globals.clone(), seed: rand_seed(), $($f: wb.$f.clone()),* }
+        }
+        /// Put the state back (the journal is rolled back separately); returns the journal mark.
+        fn put_snap(wb: &mut World, live: &mut Live, s: Snap) -> usize {
+            (wb.file.txn, wb.file.next_id, wb.file.current_card) = (s.txn, s.next_id, s.current_card);
+            wb.log.truncate(s.log_len);
+            live.globals = s.globals;
+            set_rand_seed(s.seed);
+            $(wb.$f = s.$f;)*
+            s.mark
+        }
+    };
+}
+run_state! {
+    result: String, item_delim: String, timers: Vec<(f64, u32, String)>, push_list: Vec<u32>, selection: Option<(u32, usize, usize)>,
+    focused: Option<u32>, user_level: i64, open_files: Rc<HashMap<String, OpenFile>>, effect: Option<String>, effect_seq: u64,
+    sound: Option<String>, draw: Rc<HashMap<u32, Vec<Shape>>>, mouse_click: bool, click_loc: (f64, f64), libs: Rc<Vec<Obj>>,
+    visited: Rc<Vec<Obj>>, tool: Tool, line_size: i64, filled: bool, menus: Rc<Vec<Menu>>, recent: std::collections::VecDeque<u32>,
+    lock_recent: bool,
 }
 
 struct Paused { entry: Entry, snap: Snap, tape: Vec<(String, Dynamic)> }
@@ -326,7 +354,7 @@ fn navigate(engine: &Engine, w: &W, live: &L, target: u32) -> R<()> {
     // Handlers for system messages write "automatic" changes, which Undo skips.
     // With lockMessages set, the card changes silently.
     let quiet = w.borrow().lock_messages;
-    { let mut wb = w.borrow_mut(); if !wb.lock_recent { wb.recent.push(from); if wb.recent.len() > 200 { wb.recent.remove(0); } } }
+    { let mut wb = w.borrow_mut(); if !wb.lock_recent { wb.recent.push_back(from); if wb.recent.len() > RECENT_MAX { wb.recent.pop_front(); } } }
     let (bg_from, bg_to) = { let wb = w.borrow(); (wb.background_of(from), wb.background_of(target)) };
     w.borrow_mut().auto_depth += 1;
     let send = |id: u32, m: &str| -> R<bool> { if quiet { Ok(false) } else { dispatch(engine, w, live, id, m, vec![]) } };
@@ -407,7 +435,35 @@ fn slot(look: &str) -> ImmutableString {
 fn is_direction(look: &str) -> bool { matches!(look, "left" | "right" | "up" | "down" | "open" | "close" | "in" | "out") }
 
 fn effect_name(inputs: &[rhai::Expression]) -> String {
-    inputs.iter().filter_map(|i| i.get_string_value().map(|s| s.to_lowercase())).collect::<Vec<_>>().join("-")
+    effect_from_words(inputs.iter().filter_map(|i| i.get_string_value()))
+}
+
+/// A visual effect's name from its words (`barn door open slowly to black` → `barn-door-open`): speed words
+/// and a `to <colour>` ending do not change the effect here.
+fn effect_from_words<'a>(words: impl IntoIterator<Item = &'a str>) -> String {
+    words.into_iter().map(str::to_lowercase).take_while(|w| w != "to").filter(|w| !matches!(w.as_str(), "very" | "slow" | "slowly" | "fast")).collect::<Vec<_>>().join("-")
+}
+
+/// A value as a number: numbers, and text that reads as one.
+fn num(d: &Dynamic) -> Option<f64> {
+    d.as_float().ok().or_else(|| d.as_int().ok().map(|i| i as f64)).or_else(|| d.clone().into_string().ok().and_then(|s| s.trim().parse().ok()))
+}
+
+/// A point written "h,v".
+fn point(d: &Dynamic, what: &str) -> R<(f64, f64)> {
+    let p: Vec<f64> = d.to_string().split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    if p.len() == 2 { Ok((p[0], p[1])) } else { Err(err(&format!("{what} needs a point \"h,v\""))) }
+}
+
+/// `n <unit>` in milliseconds (wait, send … in): ticks are 1/60 s. None for a unit that is not one.
+fn duration_ms(n: f64, unit: &str) -> Option<f64> {
+    match unit { "seconds" | "second" | "secs" | "sec" => Some(n * 1000.0), "ticks" | "tick" => Some(n * 1000.0 / 60.0),
+                 "milliseconds" | "millisecond" | "ms" => Some(n), _ => None }
+}
+
+/// A text as a HyperTalk expression: a literal, with `quote` for the quote marks it holds.
+fn hypertalk_literal(text: &str) -> String {
+    text.split('"').map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(" & quote & ")
 }
 
 fn canvas_target(w: &W, live: &L) -> Option<u32> {
@@ -586,7 +642,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
             let r = ctx.eval_expression_tree_raw(&inputs[n - 1], false);
             let names = live.borrow().frames.last().map(|f| f.globals.clone()).unwrap_or_default();
             for name in names {
-                if let Some(v) = ctx.scope().get_value::<Dynamic>(&name) { live.borrow_mut().globals.insert(name, v); }
+                if let Some(v) = ctx.scope().get_value::<Dynamic>(&name) { Rc::make_mut(&mut live.borrow_mut().globals).insert(name, v); }
             }
             ctx.scope_mut().rewind(base);
             match r {
@@ -1021,7 +1077,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 "windows" => Dynamic::from(std::iter::once("card window".to_string()).chain(std::iter::once("message window".to_string()))
                     .chain(wb.open_stacks.iter().filter(|s| **s != wb.file.name).cloned()).collect::<Vec<_>>().join("\n")),
                 "screenrect" => Dynamic::from(format!("0,0,{},{}", wb.screen.0.round(), wb.screen.1.round())),
-                "windowloc" | "loc of card window" => Dynamic::from(format!("{},{}", wb.window_loc.0.round(), wb.window_loc.1.round())),
+                "windowloc" => Dynamic::from(format!("{},{}", wb.window_loc.0.round(), wb.window_loc.1.round())),
                 // Memory and disk are not limits here; these report HyperCard-sized room to spare, not a measurement.
                 "diskspace" | "heapspace" | "stackspace" | "freesize" => Dynamic::from(i32::MAX as i64),
                 "systemversion" => Dynamic::from(format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)),
@@ -1271,7 +1327,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
             }
             let name = ctx.eval_expression_tree(&inputs[0])?.to_string();
             let mut wb = w.borrow_mut();
-            let Some(a) = wb.file.asset(&name).filter(|a| a.kind == "sound").cloned() else { return Err(err(&format!("there is no sound \"{name}\" in this stack"))) };
+            let Some(a) = wb.file.asset(&name).filter(|a| a.kind == AssetKind::Sound).cloned() else { return Err(err(&format!("there is no sound \"{name}\" in this stack"))) };
             wb.sound = Some(a.name.clone());
             wb.sound_cmds.push(SoundCmd::Play(a.name));
             Ok(Dynamic::UNIT)
@@ -1313,18 +1369,15 @@ fn build_engine(w: &W, live: &L) -> Engine {
             Ok(Some(look.into()))
         }, false,
         move |ctx, inputs, state| {
-            let name = if inputs.is_empty() {
-                state.to_string().split_whitespace().filter(|w| *w != "can").collect::<Vec<_>>().join(" ")
+            let tool = if inputs.is_empty() {
+                let name = state.to_string().split_whitespace().filter(|w| *w != "can").collect::<Vec<_>>().join(" ");
+                name.parse::<Tool>().map_err(|_| err(&format!("choose what? no {name} tool")))?
             } else {
-                let n = from_dyn(&ctx.eval_expression_tree(&inputs[0])?).int();
-                TOOLS.get((n - 1).max(0) as usize).filter(|_| n >= 1).ok_or_else(|| err("choose tool 1 to 18"))?.to_string()
+                Tool::from_number(from_dyn(&ctx.eval_expression_tree(&inputs[0])?).int()).ok_or_else(|| err("choose tool 1 to 18"))?
             };
-            let name = match name.as_str() { "rect" => "rectangle".to_string(), "roundrect" | "round rectangle" => "round rect".to_string(), n => n.to_string() };
-            let i = TOOLS.iter().position(|t| *t == name).ok_or_else(|| err(&format!("choose what? no {name} tool")))?;
-            let level = w.borrow().user_level;
-            let need = match i { 0 => 1, 1 | 2 => 4, _ => 3 };
-            if level < need { return Err(err(&format!("the {name} tool needs userLevel {need} or more"))); }
-            w.borrow_mut().tool = name;
+            let need = tool.user_level();
+            if w.borrow().user_level < need { return Err(err(&format!("the {tool} tool needs userLevel {need} or more"))); }
+            w.borrow_mut().tool = tool;
             Ok(Dynamic::UNIT)
         });
     }
@@ -1345,20 +1398,19 @@ fn build_engine(w: &W, live: &L) -> Engine {
             _ => None,
         }), false,
         move |ctx, inputs, _| {
-            let pt = |d: Dynamic| -> R<(f64, f64)> { let p: Vec<f64> = d.to_string().split(',').filter_map(|x| x.trim().parse().ok()).collect(); if p.len() == 2 { Ok((p[0], p[1])) } else { Err(err("drag needs points \"h,v\"")) } };
-            let a = pt(ctx.eval_expression_tree(&inputs[0])?)?;
-            let b = pt(ctx.eval_expression_tree(&inputs[1])?)?;
+            let a = point(&ctx.eval_expression_tree(&inputs[0])?, "drag")?;
+            let b = point(&ctx.eval_expression_tree(&inputs[1])?, "drag")?;
             let keys: Vec<String> = inputs[2..].iter().filter_map(|i| i.get_string_value()).map(|k| match k.to_lowercase().as_str() { "shiftkey" => "Shift", "optionkey" => "Alt", "commandkey" | "cmdkey" => "Meta", _ => "" }.to_string()).filter(|k| !k.is_empty()).collect();
-            let tool = w.borrow().tool.clone();
-            if is_paint_tool(&tool) {
-                if matches!(tool.as_str(), "select" | "lasso" | "bucket" | "text") { w.borrow_mut().result = format!("The {tool} tool does not paint here."); return Ok(Dynamic::UNIT); }
+            let tool = w.borrow().tool;
+            if tool.is_paint() {
+                if !tool.strokes() { w.borrow_mut().result = format!("The {tool} tool does not paint here."); return Ok(Dynamic::UNIT); }
                 let mut wb = w.borrow_mut();
                 let card = wb.current_card();
                 add_stroke(&mut wb, card, &[a, b]);
                 return Ok(Dynamic::UNIT);
             }
-            if tool == "button" || tool == "field" {
-                let kind = if tool == "button" { Kind::Button } else { Kind::Field };
+            if tool.edits_parts() {
+                let kind = if tool == Tool::Button { Kind::Button } else { Kind::Field };
                 let mut wb = w.borrow_mut();
                 if let Some(id) = part_at(&wb, a, &[kind]) {
                     let (l, t) = (wb.get(id, "left").int(), wb.get(id, "top").int());
@@ -1370,7 +1422,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
             let (target, rect) = {
                 let wb = w.borrow();
                 match part_at(&wb, a, &[Kind::Button, Kind::Field, Kind::Canvas]) {
-                    Some(id) => (id, Some(["left", "top", "width", "height"].map(|k| wb.get(id, k).int() as f64))),
+                    Some(id) => (id, Some(wb.rect(id).map(|v| v as f64))),
                     None => (wb.current_card(), None),
                 }
             };
@@ -1402,36 +1454,35 @@ fn build_engine(w: &W, live: &L) -> Engine {
         |syms: &[ImmutableString], look: &str, _| Ok(if syms.len() == 1 { Some(slot(look)) } else { None }), false,
         move |ctx, inputs, _| {
             let n = ctx.eval_expression_tree(&inputs[0])?.to_string();
-            let wb = w.borrow();
-            let m = wb.menus.iter().find(|m| m.name.eq_ignore_ascii_case(&n)).ok_or_else(|| err(&format!("no menu \"{n}\"")))?;
+            let mut wb = w.borrow_mut();
+            let m = wb.menu_mut(&n).map_err(|e| err(&e))?;
             Ok(Dynamic::from(m.items.iter().map(|i| i.text.clone()).collect::<Vec<_>>().join("\n")))
         }); }
 
     // Menus (statements rewritten by `menu_statement`).
-    { let w = w.clone(); e.register_fn("__messageBox", move |on: bool| { let mut wb = w.borrow_mut(); wb.message_visible = on; if on { wb.message_request = true; } }); }
-    { let w = w.clone(); e.register_fn("__menuReset", move || { w.borrow_mut().menus = default_menus(); }); }
+    { let w = w.clone(); e.register_fn("__messageBox", move |on: bool| { let mut wb = w.borrow_mut(); wb.message_visible = on; if on { wb.player_requests.push(PlayerRequest::FocusMessageBox); } }); }
+    { let w = w.clone(); e.register_fn("__menuReset", move || { w.borrow_mut().menus = Rc::new(default_menus()); }); }
     { let w = w.clone(); e.register_fn("__menuDelete", move |name: Dynamic| -> R<()> {
         let n = name.to_string();
         let mut wb = w.borrow_mut();
         let i = wb.menus.iter().position(|m| m.name.eq_ignore_ascii_case(&n)).ok_or_else(|| err(&format!("no menu \"{n}\"")))?;
-        wb.menus.remove(i);
+        Rc::make_mut(&mut wb.menus).remove(i);
         Ok(())
     }); }
     { let w = w.clone(); e.register_fn("__menuPut", move |value: Dynamic, how: &str, name: Dynamic, msgs: Dynamic| -> R<()> {
-        let n = name.to_string();
         let mut wb = w.borrow_mut();
-        let m = wb.menus.iter_mut().find(|m| m.name.eq_ignore_ascii_case(&n)).ok_or_else(|| err(&format!("no menu \"{n}\"")))?;
+        let m = wb.menu_mut(&name.to_string()).map_err(|e| err(&e))?;
         // Items are separated by returns or commas; menuMessages likewise, one per item.
-        let split = |s: String| -> Vec<String> { if s.is_empty() { vec![] } else { s.split(|c| c == '\n' || c == ',').map(|x| x.trim().to_string()).collect() } };
+        let split = |s: String| -> Vec<String> { if s.is_empty() { vec![] } else { s.split(['\n', ',']).map(|x| x.trim().to_string()).collect() } };
         let msgs = split(msgs.to_string());
         let items: Vec<MenuItem> = split(value.to_string()).into_iter().enumerate().map(|(i, t)| { let mut it = MenuItem::new(&t); it.message = msgs.get(i).cloned().unwrap_or_default(); it }).collect();
-        match how { "into" => m.items = items, "before" => { let mut v = items; v.extend(m.items.drain(..)); m.items = v; } _ => m.items.extend(items) }
+        match how { "into" => m.items = items, "before" => { m.items.splice(0..0, items); } _ => m.items.extend(items) }
         Ok(())
     }); }
     { let w = w.clone(); e.register_fn("__menuItem", move |op: &str, item: Dynamic, name: Dynamic| -> R<()> {
         let (it, n) = (item.to_string(), name.to_string());
         let mut wb = w.borrow_mut();
-        let m = wb.menus.iter_mut().find(|m| m.name.eq_ignore_ascii_case(&n)).ok_or_else(|| err(&format!("no menu \"{n}\"")))?;
+        let m = wb.menu_mut(&n).map_err(|e| err(&e))?;
         if it.is_empty() { for i in &mut m.items { i.enabled = op == "enable"; } return Ok(()); }
         let k = match it.trim().parse::<usize>() { Ok(k) if k >= 1 => Some(k - 1), _ => m.items.iter().position(|i| i.text.eq_ignore_ascii_case(&it)) }
             .filter(|k| *k < m.items.len()).ok_or_else(|| err(&format!("no menu item \"{it}\" in menu \"{n}\"")))?;
@@ -1463,10 +1514,10 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 "delete card" => "delete this card;".into(),
                 "find…" | "find" => "ask \"Find:\"; if it != \"\" { find it; }".into(),
                 "new stack…" | "new stack" => "ask \"Name of the new stack:\"; if it != \"\" { create stack it; go to stack it in a new window; }".into(),
-                "undo" => { w.borrow_mut().undo_request = true; return Ok(()); }
-                "message" => { let mut wb = w.borrow_mut(); wb.message_visible = true; wb.message_request = true; return Ok(()); }
-                "quit hypercard" | "quit" => { dispatch(ctx.engine(), &w, &live, card, "quit", vec![])?; w.borrow_mut().quit_request = true; return Ok(()); }
-                k if TOOLS.contains(&k) => format!("choose {k} tool;"),
+                "undo" => { w.borrow_mut().player_requests.push(PlayerRequest::Undo); return Ok(()); }
+                "message" => { let mut wb = w.borrow_mut(); wb.message_visible = true; wb.player_requests.push(PlayerRequest::FocusMessageBox); return Ok(()); }
+                "quit hypercard" | "quit" => { dispatch(ctx.engine(), &w, &live, card, "quit", vec![])?; w.borrow_mut().player_requests.push(PlayerRequest::Quit); return Ok(()); }
+                k if k.parse::<Tool>().is_ok() => format!("choose {k} tool;"),
                 _ if found.is_some() => return Ok(()),
                 _ => return Err(err(&format!("doMenu: no menu item \"{item}\""))),
             };
@@ -1491,11 +1542,9 @@ fn build_engine(w: &W, live: &L) -> Engine {
             Ok(Some(if look == "in" { "in".into() } else { "$ident$".into() }))
         }, false,
         move |_, _, state| {
-            let words: Vec<String> = state.to_string().split_whitespace().map(String::from).collect();
-            let cut = words.iter().position(|w| w == "to").unwrap_or(words.len());
-            let name: Vec<&str> = words[..cut].iter().map(|s| s.as_str()).filter(|w| !matches!(*w, "very" | "slow" | "slowly" | "fast")).collect();
+            let name = effect_from_words(state.to_string().split_whitespace().collect::<Vec<_>>());
             if name.is_empty() { return Err(err("visual effect what? e.g. visual effect dissolve")); }
-            w.borrow_mut().visual = Some(name.join("-"));
+            w.borrow_mut().visual = Some(name);
             Ok(Dynamic::UNIT)
         });
     }
@@ -1505,12 +1554,12 @@ fn build_engine(w: &W, live: &L) -> Engine {
     fn f(d: &Dynamic) -> f64 { d.as_float().ok().or_else(|| d.as_int().ok().map(|i| i as f64)).or_else(|| d.clone().into_string().ok().and_then(|s| s.trim().parse().ok())).unwrap_or(0.0) }
     fn draw(w: &W, live: &L, s: Shape) -> R<()> {
         let id = canvas_target(w, live).ok_or_else(|| err("there is no canvas on this card to draw on"))?;
-        w.borrow_mut().draw.entry(id).or_default().push(s);
+        Rc::make_mut(&mut w.borrow_mut().draw).entry(id).or_default().push(s);
         Ok(())
     }
     { let (w, live) = (w.clone(), live.clone()); e.register_fn("clear", move || -> R<()> {
         let id = canvas_target(&w, &live).ok_or_else(|| err("there is no canvas on this card to clear"))?;
-        w.borrow_mut().draw.remove(&id); Ok(()) }); }
+        Rc::make_mut(&mut w.borrow_mut().draw).remove(&id); Ok(()) }); }
     { let (w, live) = (w.clone(), live.clone()); e.register_fn("rect", move |x: Dynamic, y: Dynamic, wd: Dynamic, h: Dynamic, c: &str| {
         draw(&w, &live, Shape::Rect { x: f(&x), y: f(&y), w: f(&wd), h: f(&h), color: c.into() }) }); }
     { let (w, live) = (w.clone(), live.clone()); e.register_fn("circle", move |x: Dynamic, y: Dynamic, r: Dynamic, c: &str| {
@@ -1584,10 +1633,14 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 let Some(path) = found else { w.borrow_mut().result = "No such stack.".into(); return Ok(Dynamic::UNIT) };
                 let mut wb = w.borrow_mut();
                 wb.result.clear();
-                let effect = if st.effect.is_empty() { None } else { Some(st.effect.join("-")) };
+                // `go … with <effect>`, else the effect a `visual effect` command set earlier in this run.
+                let pending = wb.visual.take();
+                let effect = if st.effect.is_empty() { pending } else { Some(effect_from_words(st.effect.iter().map(String::as_str))) };
                 wb.go_stack = Some(GoStack { path, card: card_key, new_window: st.new_window, effect });
                 return Ok(Dynamic::UNIT);
             }
+            // For `go back`: where the card gone back to sits in the recent list (it and what follows are dropped once there).
+            let mut back_at = None;
             let target = {
                 let wb = w.borrow();
                 let cards = wb.cards();
@@ -1599,7 +1652,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
                     ("first", _) => cards.first().copied(),
                     ("last", _) => cards.last().copied(),
                     // The card before this one in the recent list (go back walks back through it).
-                    ("back", _) => { drop(cards); let mut found = None; drop(wb); let mut wb = w.borrow_mut(); while let Some(c) = wb.recent.pop() { if wb.obj(c).is_some() && c != wb.current_card() { found = Some(c); break; } } found }
+                    ("back", _) => { back_at = wb.recent.iter().rposition(|c| wb.obj(*c).is_some() && *c != wb.current_card()); back_at.map(|i| wb.recent[i]) }
                     ("to", Some(Value::Int(i))) => cards.get((i as usize).wrapping_sub(1)).copied(),
                     ("to", Some(v)) => { let name = v.text().to_lowercase(); cards.iter().copied().find(|c| wb.obj(*c).map(|o| o.name.to_lowercase() == name).unwrap_or(false)) }
                     _ => return Err(err("go where? use next, prev, first, last, card <name> or stack <name>")),
@@ -1612,11 +1665,11 @@ fn build_engine(w: &W, live: &L) -> Engine {
             if !dispatch(ctx.engine(), &w, &live, from, "go", vec![name.into()])? {
                 // `go … with <effect>`, else the effect a `visual effect` command set earlier in this run.
                 let pending = w.borrow_mut().visual.take();
-                if !st.effect.is_empty() { w.borrow_mut().set_effect(&st.effect.join("-")); }
+                if !st.effect.is_empty() { w.borrow_mut().set_effect(&effect_from_words(st.effect.iter().map(String::as_str))); }
                 else if let Some(v) = pending { w.borrow_mut().set_effect(&v); }
                 navigate(ctx.engine(), &w, &live, target)?;
-                // Going back does not add to the recent list.
-                if how == "back" { w.borrow_mut().recent.pop(); }
+                // Going back does not add to the recent list; the card gone back to (and anything after it) leaves it.
+                if let Some(i) = back_at { w.borrow_mut().recent.truncate(i); }
             }
             Ok(Dynamic::UNIT)
         });
@@ -1797,9 +1850,8 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 { let mut t = tape.borrow_mut(); t.entries.truncate(at); t.pos = at; }
                 return Err(pause(&live, Waiting::Poll(now_ms() + 30.0)));
             }
-            let n = ctx.eval_expression_tree(&inputs[0])?;
-            let n = n.as_float().ok().or_else(|| n.as_int().ok().map(|x| x as f64)).or_else(|| n.to_string().trim().parse().ok()).ok_or_else(|| err("wait needs a number"))?;
-            let ms = match how.as_str() { "seconds" | "second" | "secs" | "sec" => n * 1000.0, "milliseconds" | "millisecond" | "ms" => n, _ => n * 1000.0 / 60.0 };
+            let n = num(&ctx.eval_expression_tree(&inputs[0])?).ok_or_else(|| err("wait needs a number"))?;
+            let ms = duration_ms(n, &how).unwrap_or_else(|| n * 1000.0 / 60.0);
             if ms <= 0.0 { return Ok(Dynamic::UNIT); }
             if pause_point(&w, &live, "wait")?.is_some() { return Ok(Dynamic::UNIT); }
             Err(pause(&live, Waiting::Until(now_ms() + ms)))
@@ -1819,7 +1871,6 @@ fn build_engine(w: &W, live: &L) -> Engine {
         }, false,
         move |ctx, inputs, state| {
             let flags = state.to_string();
-            let (desc, numeric) = (flags.contains("descending"), flags.contains("numeric"));
             let (cards, here) = { let wb = w.borrow(); (wb.cards(), wb.current_card()) };
             let mut keyed = vec![];
             for c in &cards {
@@ -1829,12 +1880,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 w.borrow_mut().file.current_card = here;
                 keyed.push((k?.to_string(), *c));
             }
-            if numeric {
-                keyed.sort_by(|a, b| { let f = |s: &str| s.trim().parse::<f64>().unwrap_or(f64::INFINITY); f(&a.0).partial_cmp(&f(&b.0)).unwrap_or(std::cmp::Ordering::Equal) });
-            } else {
-                keyed.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-            }
-            if desc { keyed.reverse(); }
+            sort_keyed(&mut keyed, &flags);
             let order: Vec<u32> = keyed.into_iter().map(|(_, c)| c).collect();
             w.borrow_mut().reorder_cards(&order);
             Ok(Dynamic::UNIT)
@@ -1939,20 +1985,12 @@ fn build_engine(w: &W, live: &L) -> Engine {
     // click at "<h>,<v>"  -- as if the user clicked the button or field there (card coordinates)
     { let (w, live) = (w.clone(), live.clone());
       e.register_custom_syntax(["click", "at", "$expr$"], false, move |ctx, inputs| {
-        let p: Vec<f64> = ctx.eval_expression_tree(&inputs[0])?.to_string().split(',').filter_map(|x| x.trim().parse().ok()).collect();
-        if p.len() != 2 { return Err(err("click at needs a point \"h,v\"")); }
-        let hit = {
-            let wb = w.borrow();
-            wb.parts_on(wb.current_card()).into_iter().rev().find(|id| {
-                let Some(o) = wb.obj(*id) else { return false };
-                if !matches!(o.kind, Kind::Button | Kind::Field) || !wb.get(*id, "visible").truthy() { return false; }
-                let r = ["left", "top", "width", "height"].map(|k| wb.get(*id, k).int() as f64);
-                p[0] >= r[0] && p[0] < r[0] + r[2] && p[1] >= r[1] && p[1] < r[1] + r[3]
-            })
-        };
-        if is_paint_tool(&w.borrow().tool) { let mut wb = w.borrow_mut(); let card = wb.current_card(); add_stroke(&mut wb, card, &[(p[0], p[1])]); return Ok(Dynamic::UNIT); }
-        let target = hit.unwrap_or_else(|| w.borrow().current_card());
-        w.borrow_mut().click_loc = (p[0], p[1]);
+        let p = point(&ctx.eval_expression_tree(&inputs[0])?, "click at")?;
+        // With a paint tool a click paints a dot (or does nothing, for a tool that leaves no stroke).
+        let tool = w.borrow().tool;
+        if tool.is_paint() { if tool.strokes() { let mut wb = w.borrow_mut(); let card = wb.current_card(); add_stroke(&mut wb, card, &[p]); } return Ok(Dynamic::UNIT); }
+        let target = { let wb = w.borrow(); part_at(&wb, p, &[Kind::Button, Kind::Field]).unwrap_or_else(|| wb.current_card()) };
+        w.borrow_mut().click_loc = p;
         dispatch(ctx.engine(), &w, &live, target, "mouseDown", vec![])?;
         dispatch(ctx.engine(), &w, &live, target, "mouseUp", vec![])?;
         Ok(Dynamic::UNIT)
@@ -1996,23 +2034,20 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 let name = ctx.eval_expression_tree(inputs.first().ok_or_else(|| err("create menu needs a name"))?)?.to_string();
                 let mut wb = w.borrow_mut();
                 if wb.menus.iter().any(|m| m.name.eq_ignore_ascii_case(&name)) { return Err(err(&format!("there is already a menu \"{name}\""))); }
-                wb.menus.push(Menu { name, items: vec![] });
+                Rc::make_mut(&mut wb.menus).push(Menu { name, items: vec![] });
                 return Ok(Dynamic::UNIT);
             }
             if state.to_string() == "stack" {
                 // create stack "<name>": a new stack file, one card on one background, in this stack's folder.
                 let name = ctx.eval_expression_tree(inputs.first().ok_or_else(|| err("create stack needs a name"))?)?.to_string();
                 let name = name.trim().trim_end_matches(".stack").to_string();
+                if name.is_empty() { return Err(err("create stack needs a name")); }
                 let (width, height, path) = { let wb = w.borrow(); (wb.file.width, wb.file.height, wb.path(&format!("{name}.stack"))) };
                 if w.borrow().fs.borrow().is_file(&path) { return Err(err(&format!("there is already a stack \"{name}\""))); }
-                let mut nw = World::new(StackFile::new(&name, width, height));
-                let st = nw.create(Kind::Stack, &name, None, None);
-                let bg = nw.create(Kind::Background, "background 1", Some(st), None);
-                let card = nw.create(Kind::Card, "card 1", Some(bg), None);
-                nw.file.current_card = card;
-                nw.file.journal.clear();
+                let mut file = crate::demo::blank(&name);
+                (file.width, file.height) = (width, height);
                 let fs = w.borrow().fs.clone();
-                fs.borrow_mut().write_bytes(&path, &nw.file.to_zip()).map_err(|e| err(&e))?;
+                fs.borrow_mut().write_bytes(&path, &file.to_zip()).map_err(|e| err(&e))?;
                 w.borrow_mut().result.clear();
                 return Ok(Dynamic::UNIT);
             }
@@ -2098,7 +2133,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
             let text = w.borrow().fs.borrow().read(&p).unwrap_or_default();
             let mut wb = w.borrow_mut();
             if !wb.fs.borrow().is_file(&p) { wb.fs.borrow_mut().write(&p, "").map_err(|e| err(&e))?; }
-            wb.open_files.insert(p, crate::model::OpenFile { text, read_pos: 0, written: false });
+            Rc::make_mut(&mut wb.open_files).insert(p, crate::model::OpenFile { text, read_pos: 0, written: false });
             wb.result.clear();
             Ok(Dynamic::UNIT)
         });
@@ -2108,7 +2143,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
         |syms: &[ImmutableString], look: &str, _| Ok(match syms.len() { 1 => Some("file".into()), 2 => Some(slot(look)), _ => None }), false,
         move |ctx, inputs, _| {
             let p = { let wb = w.borrow(); wb.path(&ctx.eval_expression_tree(&inputs[0])?.to_string()) };
-            let f = w.borrow_mut().open_files.remove(&p).ok_or_else(|| err(&format!("file \"{p}\" is not open")))?;
+            let f = Rc::make_mut(&mut w.borrow_mut().open_files).remove(&p).ok_or_else(|| err(&format!("file \"{p}\" is not open")))?;
             if f.written { let fs = w.borrow().fs.clone(); fs.borrow_mut().write(&p, &f.text).map_err(|e| err(&e))?; }
             Ok(Dynamic::UNIT)
         });
@@ -2133,7 +2168,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
             let by_count = state.as_bool().unwrap_or(false);
             let (got, at_end) = {
                 let mut wb = w.borrow_mut();
-                let f = wb.open_files.get_mut(&p).ok_or_else(|| err(&format!("file \"{p}\" is not open; use open file first")))?;
+                let f = Rc::make_mut(&mut wb.open_files).get_mut(&p).ok_or_else(|| err(&format!("file \"{p}\" is not open; use open file first")))?;
                 let chars: Vec<char> = f.text.chars().collect();
                 let start = f.read_pos.min(chars.len());
                 let end = if by_count { (start + index(&arg)?.max(0) as usize).min(chars.len()) } else {
@@ -2169,7 +2204,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
             let p = { let wb = w.borrow(); wb.path(&ctx.eval_expression_tree(&inputs[1])?.to_string()) };
             let at = if inputs.len() > 2 { Some(ctx.eval_expression_tree(&inputs[2])?) } else { None };
             let mut wb = w.borrow_mut();
-            let f = wb.open_files.get_mut(&p).ok_or_else(|| err(&format!("file \"{p}\" is not open; use open file first")))?;
+            let f = Rc::make_mut(&mut wb.open_files).get_mut(&p).ok_or_else(|| err(&format!("file \"{p}\" is not open; use open file first")))?;
             match at {
                 None => { if !f.written { f.text.clear(); } f.text.push_str(&text); }
                 Some(a) if a.to_string() == "\u{4}" || a.to_string() == "end" => f.text.push_str(&text),
@@ -2190,7 +2225,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
     // delete file|folder <path> | delete <chunk> <n> of <variable | field <name>>  -- removes the chunk and its delimiter
     { let (w, live) = (w.clone(), live.clone());
       #[derive(Clone, Default)]
-      struct DelSt { what: String, field: bool, var: bool, phase: u8 }
+      struct DelSt { what: String, field: bool, var: bool, by_id: bool, phase: u8 }
       e.register_custom_syntax_with_state_raw("delete",
         |syms: &[ImmutableString], look: &str, state: &mut Dynamic| {
             let mut st = if syms.len() == 1 { DelSt::default() } else { state.clone_cast::<DelSt>() };
@@ -2198,7 +2233,9 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 0 if look == "this" => { st.what = "card".into(); st.phase = 30; Some("this".into()) }
                 30 => { st.phase = 10; Some("card".into()) }
                 0 if look == "card" => { st.what = "card".into(); st.phase = 31; Some("card".into()) }
-                31 => if look.starts_with('"') || look.starts_with('(') || look.chars().next().is_some_and(|c| c.is_ascii_digit()) { st.phase = 10; Some(slot(look)) } else { None },
+                // `delete card` alone is this card; `delete card <name, number or variable>`, `delete card id <n>`.
+                31 if look == "id" => { st.by_id = true; st.phase = 9; Some("id".into()) }
+                31 => if look.starts_with(['"', '(']) || look.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_') { st.phase = 10; Some(slot(look)) } else { None },
                 0 => { st.what = look.into(); st.phase = if matches!(look, "file" | "folder") { 9 } else { 1 }; Some(look.into()) }
                 9 => { st.phase = 10; Some(slot(look)) }
                 1 => { st.phase = 2; Some("$expr$".into()) }
@@ -2215,7 +2252,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
             if st.what == "card" {
                 // delete [this] card [<name>]: deleteCard goes to it, then the next card shows.
                 let key = if inputs.is_empty() { None } else { Some(ctx.eval_expression_tree(&inputs[0])?) };
-                let card = resolve(&w, &live, "card", key.as_ref())?;
+                let card = resolve(&w, &live, if st.by_id { "card#id" } else { "card" }, key.as_ref())?;
                 let (n, here) = { let wb = w.borrow(); (wb.cards().len(), wb.current_card()) };
                 if n <= 1 { return Err(err("can't delete the last card")); }
                 dispatch(ctx.engine(), &w, &live, card, "deleteCard", vec![])?;
@@ -2295,16 +2332,12 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 if start {
                     let found = w.borrow().find_stack(&name);
                     let Some(path) = found else { w.borrow_mut().result = "No such stack.".into(); return Ok(Dynamic::UNIT) };
-                    let file = match path.strip_prefix("demo:") {
-                        Some(n) => crate::demo::by_name(n).ok_or_else(|| err("no such demo"))?,
-                        None => { let bytes = w.borrow().fs.borrow().read_bytes(&path).map_err(|e| err(&e))?; StackFile::from_bytes(&bytes).map_err(|e| err(&e))? }
-                    };
-                    let Some(mut obj) = file.objs.iter().find(|o| o.kind == Kind::Stack).cloned() else { return Err(err("that file has no stack")) };
+                    let mut obj = load_stack_obj(&w, &path)?;
                     if w.borrow().libs.iter().any(|l| l.name.eq_ignore_ascii_case(&obj.name)) { return Ok(Dynamic::UNIT); }
                     let id = LIB0 + w.borrow().libs.len() as u32;
                     obj.id = id; obj.parent = None;
                     let src = obj.script.clone();
-                    w.borrow_mut().libs.push(obj);
+                    Rc::make_mut(&mut w.borrow_mut().libs).push(obj);
                     compile_into(ctx.engine(), &live, id, &src);
                     w.borrow_mut().result.clear();
                     dispatch(ctx.engine(), &w, &live, id, "libraryStack", vec![])?;
@@ -2312,9 +2345,9 @@ fn build_engine(w: &W, live: &L) -> Engine {
                     let pos = w.borrow().libs.iter().position(|l| l.name.eq_ignore_ascii_case(name.trim().trim_end_matches(".stack")));
                     let Some(pos) = pos else { return Ok(Dynamic::UNIT) };
                     dispatch(ctx.engine(), &w, &live, LIB0 + pos as u32, "releaseStack", vec![])?;
-                    w.borrow_mut().libs.remove(pos);
+                    Rc::make_mut(&mut w.borrow_mut().libs).remove(pos);
                     // Library ids are positions: renumber and recompile the ones after it.
-                    let libs: Vec<(u32, String)> = { let mut wb = w.borrow_mut(); wb.libs.iter_mut().enumerate().map(|(i, l)| { l.id = LIB0 + i as u32; (l.id, l.script.clone()) }).collect() };
+                    let libs: Vec<(u32, String)> = { let mut wb = w.borrow_mut(); Rc::make_mut(&mut wb.libs).iter_mut().enumerate().map(|(i, l)| { l.id = LIB0 + i as u32; (l.id, l.script.clone()) }).collect() };
                     { let mut lb = live.borrow_mut(); lb.asts.retain(|k, _| *k < LIB0); lb.errors.retain(|k, _| *k < LIB0); }
                     for (id, src) in libs { compile_into(ctx.engine(), &live, id, &src); }
                 }
@@ -2359,12 +2392,10 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 resolve(&w, &live, &st.r.k(), key.as_ref())?
             } else { me(&w, &live) };
             if st.later {
-                let n = ctx.eval_expression_tree(&inputs[i])?;
-                let n = n.as_float().ok().or_else(|| n.as_int().ok().map(|x| x as f64)).or_else(|| n.to_string().trim().parse().ok()).ok_or_else(|| err("send … in needs a number"))?;
+                let n = num(&ctx.eval_expression_tree(&inputs[i])?).ok_or_else(|| err("send … in needs a number"))?;
                 let unit = inputs[i + 1].get_string_value().unwrap_or("seconds").to_lowercase();
-                let ms = match unit.as_str() { "seconds" | "second" | "secs" | "sec" => n * 1000.0, "ticks" | "tick" => n * 1000.0 / 60.0, "milliseconds" | "ms" => n, u => return Err(err(&format!("send … in {n} {u}: use seconds or ticks"))) };
-                let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0);
-                w.borrow_mut().timers.push((now + ms, start, name));
+                let ms = duration_ms(n, &unit).ok_or_else(|| err(&format!("send … in {n} {unit}: use seconds or ticks")))?;
+                w.borrow_mut().timers.push((now_ms() + ms, start, name));
                 return Ok(Dynamic::UNIT);
             }
             dispatch(ctx.engine(), &w, &live, start, &name, vec![])?;
@@ -2385,9 +2416,10 @@ fn build_engine(w: &W, live: &L) -> Engine {
             _ => None,
         }),
         false,
-        |_, _, state| match state.to_string().as_str() {
+        |_, inputs, state| match state.to_string().as_str() {
             "repeat" => Err(Box::new(EvalAltResult::LoopBreak(true, Dynamic::UNIT, Position::NONE))),
-            "to" => Err(Box::new(EvalAltResult::ErrorTerminated(Dynamic::from(EXIT_ALL), Position::NONE))),
+            "to" if inputs.first().and_then(|i| i.get_string_value()).is_some_and(|t| t.eq_ignore_ascii_case("hypercard")) => Err(halt(Halt::ExitAll)),
+            "to" => Err(err("exit to what? write exit to HyperCard")),
             _ => Err(Box::new(EvalAltResult::Return(Dynamic::UNIT, Position::NONE))),
         });
 
@@ -2471,7 +2503,7 @@ impl Rt {
         let w: W = Rc::new(RefCell::new(world));
         let live: L = Rc::new(RefCell::new(Live::default()));
         let engine = build_engine(&w, &live);
-        let rt = Rt { engine, w, live, paused: RefCell::new(None), later: RefCell::new(vec![]) };
+        let rt = Rt { engine, w, live, paused: RefCell::new(None), later: RefCell::new(Default::default()) };
         let mut ids: Vec<u32> = rt.w.borrow().file.objs.iter().map(|o| o.id).collect();
         if rt.w.borrow().home.is_some() { ids.push(HOME); }
         for id in ids { rt.compile(id); }
@@ -2480,16 +2512,8 @@ impl Rt {
 
     /// Compile an object's script. On error the previous working version stays live.
     pub fn compile(&self, id: u32) {
-        let src = self.w.borrow().obj(id).map(|o| o.script.clone());
-        let mut lb = self.live.borrow_mut();
-        match src {
-            None => { lb.asts.remove(&id); lb.errors.remove(&id); }
-            Some(s) if s.trim().is_empty() => { lb.asts.remove(&id); lb.errors.remove(&id); }
-            Some(s) => match self.engine.compile(&hypertalk_words(&hypertalk_blocks(&s))).map_err(|e| e.to_string()).and_then(|ast| only_handlers(&ast).map(|_| ast)) {
-                Ok(ast) => { lb.locals.insert(id, put_targets(&ast)); lb.asts.insert(id, Rc::new(ast)); lb.errors.remove(&id); }
-                Err(e) => { lb.errors.insert(id, e); }
-            },
-        }
+        let src = self.w.borrow().obj(id).map(|o| o.script.clone()).unwrap_or_default();
+        compile_into(&self.engine, &self.live, id, &src);
     }
 
     /// Run one animation frame: send `frame` to the current card if it has a canvas part.
@@ -2573,20 +2597,16 @@ impl Rt {
     /// `idle`: the player calls this a few times a second in browse mode. The current card gets `idle`
     /// when a script on its path handles it (so stacks without one cost nothing).
     pub fn idle(&self) -> bool {
-        if self.is_paused() { return false; }
         let card = self.w.borrow().current_card();
-        let wants = {
-            let wb = self.w.borrow();
-            let mut cur = Some(card);
-            let mut found = false;
-            for _ in 0..16 {
-                let Some(id) = cur else { break };
-                if wb.obj(id).map(|o| o.script.to_lowercase().contains("idle")).unwrap_or(false) { found = true; break; }
-                cur = wb.next_on_path(id);
-            }
-            found
-        };
-        wants && self.send_with(card, "idle", vec![])
+        !self.is_paused() && self.handles(card, "idle") && self.send_with(card, "idle", vec![])
+    }
+
+    /// Whether a handler for `msg` sits on the message path from `obj` (so the player sends messages that
+    /// come every frame, such as mouseWithin, only to stacks that handle them).
+    pub fn handles(&self, obj: u32, msg: &str) -> bool {
+        let msg = msg.to_lowercase();
+        let (wb, lb) = (self.w.borrow(), self.live.borrow());
+        std::iter::successors(Some(obj), |id| wb.next_on_path(*id)).take(16).any(|id| lb.asts.get(&id).is_some_and(|a| handles(a, &msg)))
     }
 
     /// A click in a locked field at a character offset: for clickText / clickLine / clickChunk, and with
@@ -2612,13 +2632,13 @@ impl Rt {
     }
 
     /// The user chose a menu item in the player's menu bar.
-    pub fn do_menu(&self, item: &str, menu: &str) { self.exec(&format!("doMenu {item:?}, {menu:?};")); }
+    pub fn do_menu(&self, item: &str, menu: &str) { self.exec(&format!("doMenu {}, {};", hypertalk_literal(item), hypertalk_literal(menu))); }
 
     /// The user painted a stroke with the current paint tool (points in card coordinates).
     pub fn paint(&self, pts: &[(f64, f64)]) {
         if self.is_paused() || pts.is_empty() { return; }
         let mut wb = self.w.borrow_mut();
-        if !is_paint_tool(&wb.tool) || wb.user_level < 3 { return; }
+        if !wb.tool.strokes() || wb.user_level < wb.tool.user_level() { return; }
         wb.begin();
         let card = wb.current_card();
         add_stroke(&mut wb, card, pts);
@@ -2642,14 +2662,16 @@ impl Rt {
 
     /// The player fetched a `load url` request: cache it and tell the object that asked (`urlLoaded <url>`).
     pub fn url_loaded(&self, url: &str, text: &str, to: u32) {
-        if self.is_paused() { let (u, t) = (url.to_string(), text.to_string()); self.later.borrow_mut().push(Box::new(move |rt: &Rt| rt.url_loaded(&u, &t, to))); return; }
+        let (u, t) = (url.to_string(), text.to_string());
+        if self.defer(move |rt| rt.url_loaded(&u, &t, to)) { return; }
         self.w.borrow_mut().url_cache.insert(url.to_string(), text.to_string());
         if self.w.borrow().obj(to).is_some() { self.send_with(to, "urlLoaded", vec![Value::Str(url.to_string())]); }
     }
 
     /// A `load url` failed: `urlLoaded <url>, "error"`, with the reason in `the result`.
     pub fn url_failed(&self, url: &str, why: &str, to: u32) {
-        if self.is_paused() { let (u, y) = (url.to_string(), why.to_string()); self.later.borrow_mut().push(Box::new(move |rt: &Rt| rt.url_failed(&u, &y, to))); return; }
+        let (u, y) = (url.to_string(), why.to_string());
+        if self.defer(move |rt| rt.url_failed(&u, &y, to)) { return; }
         { let mut wb = self.w.borrow_mut(); wb.url_cache.remove(url); wb.result = why.to_string(); }
         if self.w.borrow().obj(to).is_some() {
             self.send_with(to, "urlLoaded", vec![Value::Str(url.to_string()), Value::Str("error".into())]);
@@ -2743,50 +2765,46 @@ impl Rt {
         let Some(p) = self.paused.borrow_mut().take() else { return };
         {
             let wb = self.w.borrow();
-            self.live.borrow_mut().settle = Some(Settle { sounds: wb.sound_cmds.len(), urls: wb.url_requests.len(), go: wb.go_stack.clone(), edit: wb.edit_request, requests: (wb.undo_request, wb.message_request, wb.quit_request) });
+            self.live.borrow_mut().settle = Some(Settle { sounds: wb.sound_cmds.len(), urls: wb.url_requests.len(), go: wb.go_stack.clone(), edit: wb.edit_request, requests: wb.player_requests.len() });
         }
         self.live.borrow_mut().waiting = None;
         self.restore(p.snap);
         self.start(p.entry, p.tape, reply);
     }
 
-    fn snapshot(&self) -> Snap {
-        let wb = self.w.borrow();
-        Snap {
-            mark: wb.file.journal.len(), txn: wb.file.txn, next_id: wb.file.next_id, current_card: wb.file.current_card,
-            log_len: wb.log.len(), result: wb.result.clone(), item_delim: wb.item_delim.clone(), timers: wb.timers.clone(),
-            push_list: wb.push_list.clone(), selection: wb.selection, focused: wb.focused, user_level: wb.user_level,
-            open_files: wb.open_files.clone(), effect: wb.effect.clone(), effect_seq: wb.effect_seq, sound: wb.sound.clone(),
-            draw: wb.draw.clone(), mouse_click: wb.mouse_click, click_loc: wb.click_loc, libs: wb.libs.clone(), visited: wb.visited.clone(), tool: wb.tool.clone(), line_size: wb.line_size, filled: wb.filled,
-            menus: wb.menus.clone(), recent: wb.recent.clone(), lock_recent: wb.lock_recent,
-            globals: self.live.borrow().globals.clone(), seed: rand_seed(),
-        }
-    }
+    fn snapshot(&self) -> Snap { take_snap(&self.w.borrow(), &self.live.borrow()) }
 
     fn restore(&self, s: Snap) {
         let ids = {
-            let mut wb = self.w.borrow_mut();
-            let ids = wb.rollback(s.mark);
-            wb.file.txn = s.txn; wb.file.next_id = s.next_id; wb.file.current_card = s.current_card;
-            wb.log.truncate(s.log_len); wb.result = s.result; wb.item_delim = s.item_delim; wb.timers = s.timers;
-            wb.push_list = s.push_list; wb.selection = s.selection; wb.focused = s.focused; wb.user_level = s.user_level;
-            wb.open_files = s.open_files; wb.effect = s.effect; wb.effect_seq = s.effect_seq; wb.sound = s.sound;
-            wb.draw = s.draw; wb.mouse_click = s.mouse_click; wb.click_loc = s.click_loc; wb.libs = s.libs; wb.visited = s.visited; wb.tool = s.tool; wb.line_size = s.line_size; wb.filled = s.filled;
-            wb.menus = s.menus; wb.recent = s.recent; wb.lock_recent = s.lock_recent;
+            let (mut wb, mut lb) = (self.w.borrow_mut(), self.live.borrow_mut());
+            let visited = s.visited.len() as u32;
+            let mark = put_snap(&mut wb, &mut lb, s);
             wb.dialog = None; wb.dialog_buttons.clear(); wb.dialog_ask = None; wb.dialog_file = None;
+            // Other stacks loaded after the snapshot are gone again; the scripts of those before it stay compiled.
+            lb.asts.retain(|k, _| *k < VISIT0 + visited);
+            lb.errors.retain(|k, _| *k < VISIT0 + visited);
+            drop(lb);
+            let mut ids = wb.rollback(mark);
+            ids.sort_unstable();
+            ids.dedup();
             ids
         };
-        { let mut lb = self.live.borrow_mut(); lb.globals = s.globals; lb.asts.retain(|k, _| *k < VISIT0); lb.errors.retain(|k, _| *k < VISIT0); }
-        set_rand_seed(s.seed);
         for id in ids { self.compile(id); }
     }
 
     /// Work that waited for a paused script.
     fn run_later(&self) {
         while !self.is_paused() {
-            let next = { let mut l = self.later.borrow_mut(); if l.is_empty() { None } else { Some(l.remove(0)) } };
-            match next { Some(f) => f(self), None => break }
+            let Some(f) = self.later.borrow_mut().pop_front() else { break };
+            f(self);
         }
+    }
+
+    /// While a script is paused (the stack is modal), keep `f` for when it finishes; true if kept.
+    fn defer(&self, f: impl FnOnce(&Rt) + 'static) -> bool {
+        if !self.is_paused() { return false; }
+        self.later.borrow_mut().push_back(Box::new(f));
+        true
     }
 
     fn fail(&self, obj: u32, e: Box<EvalAltResult>) {
@@ -2820,7 +2838,7 @@ impl Rt {
     /// The player reports that the current sound has ended: clear `the sound`, send `soundDone`.
     pub fn sound_finished(&self) {
         if self.w.borrow_mut().sound.take().is_none() { return; }
-        if self.is_paused() { self.later.borrow_mut().push(Box::new(|rt: &Rt| { let card = rt.w.borrow().current_card(); rt.send_with(card, "soundDone", vec![]); })); return; }
+        if self.defer(|rt| { let card = rt.w.borrow().current_card(); rt.send_with(card, "soundDone", vec![]); }) { return; }
         let card = self.w.borrow().current_card();
         self.send_with(card, "soundDone", vec![]);
     }
@@ -2977,9 +2995,6 @@ fn register_vocabulary(e: &mut Engine, live: &L) {
         };
         if ctx.scope().contains(name) { Ok(None) } else { Ok(Some(v)) }
     });
-    fn num(d: &Dynamic) -> Option<FLOAT> {
-        d.as_float().ok().or_else(|| d.as_int().ok().map(|i| i as FLOAT)).or_else(|| d.clone().into_string().ok().and_then(|s| s.trim().parse().ok()))
-    }
     fn need(d: &Dynamic) -> R<FLOAT> { num(d).ok_or_else(|| err(&format!("expected a number, not \"{d}\""))) }
     fn int_or_float(x: FLOAT) -> Dynamic { if x.fract() == 0.0 && x.abs() < 9e15 { Dynamic::from(x as i64) } else { Dynamic::from(x) } }
     // Verbal operators. `and`/`or` evaluate both sides (HyperTalk's guide does not say whether it short-circuits).
@@ -3304,30 +3319,37 @@ fn format_when(secs: i64, fmt: &str) -> Option<String> {
     })
 }
 
-/// Compile `src` as the script of `id`, the same way Rt::compile does.
-/// A stack by name: this one, a library in use, or another stack (loaded once from its file, read-only).
+/// A stack by name: this one, Home, a library in use, or another stack (loaded once from its file, read-only).
 fn other_stack(w: &W, name: &str) -> R<u32> {
     let n = name.trim().trim_end_matches(".stack");
     let same = |o: &Obj| o.name.eq_ignore_ascii_case(n);
     {
         let wb = w.borrow();
         if wb.file.name.eq_ignore_ascii_case(n) || wb.obj(wb.stack_id()).map(same).unwrap_or(false) { return Ok(wb.stack_id()); }
+        if wb.home.as_ref().is_some_and(|h| same(h) || n.eq_ignore_ascii_case("home")) { return Ok(HOME); }
         if let Some(i) = wb.libs.iter().position(same) { return Ok(LIB0 + i as u32); }
         if let Some(i) = wb.visited.iter().position(same) { return Ok(VISIT0 + i as u32); }
     }
     let path = w.borrow().find_stack(n).ok_or_else(|| err(&format!("no such stack \"{n}\"")))?;
-    let file = match path.strip_prefix("demo:") {
-        Some(d) => crate::demo::by_name(d).ok_or_else(|| err("no such demo"))?,
-        None => { let bytes = w.borrow().fs.borrow().read_bytes(&path).map_err(|e| err(&e))?; StackFile::from_bytes(&bytes).map_err(|e| err(&e))? }
-    };
-    let mut obj = file.objs.iter().find(|o| o.kind == Kind::Stack).cloned().ok_or_else(|| err("that file has no stack"))?;
-    if obj.name.is_empty() { obj.name = file.name.clone(); }
+    let mut obj = load_stack_obj(w, &path)?;
     let mut wb = w.borrow_mut();
     obj.id = VISIT0 + wb.visited.len() as u32;
     obj.parent = None;
     let id = obj.id;
-    wb.visited.push(obj);
+    Rc::make_mut(&mut wb.visited).push(obj);
     Ok(id)
+}
+
+/// The stack object of a stack file found by `find_stack` (`demo:<name>` is a built-in demo), named
+/// after its file if it has no name of its own.
+fn load_stack_obj(w: &W, path: &str) -> R<Obj> {
+    let file = match path.strip_prefix("demo:") {
+        Some(d) => crate::demo::by_name(d).ok_or_else(|| err("no such demo"))?,
+        None => { let bytes = w.borrow().fs.borrow().read_bytes(path).map_err(|e| err(&e))?; StackFile::from_bytes(&bytes).map_err(|e| err(&e))? }
+    };
+    let mut obj = file.objs.iter().find(|o| o.kind == Kind::Stack).cloned().ok_or_else(|| err("that file has no stack"))?;
+    if obj.name.is_empty() { obj.name = file.name.clone(); }
+    Ok(obj)
 }
 
 /// The topmost visible part of these kinds at a point on the current card.
@@ -3335,24 +3357,26 @@ fn part_at(wb: &World, p: (f64, f64), kinds: &[Kind]) -> Option<u32> {
     wb.parts_on(wb.current_card()).into_iter().rev().find(|id| {
         let Some(o) = wb.obj(*id) else { return false };
         if !kinds.contains(&o.kind) || !wb.get(*id, "visible").truthy() { return false; }
-        let r = ["left", "top", "width", "height"].map(|k| wb.get(*id, k).int() as f64);
+        let r = wb.rect(*id).map(|v| v as f64);
         p.0 >= r[0] && p.0 < r[0] + r[2] && p.1 >= r[1] && p.1 < r[1] + r[3]
     })
 }
 
-fn is_paint_tool(t: &str) -> bool { !matches!(t, "browse" | "button" | "field") }
+/// Whether a compiled script has an `on <msg>` handler (`msg` in lowercase).
+fn handles(ast: &AST, msg: &str) -> bool {
+    use rhai::{Expr, Stmt};
+    ast.statements().iter().any(|st| matches!(st, Stmt::Expr(e) if matches!(e.as_ref(), Expr::Custom(c, _) if c.tokens.first().map(|t| t.as_str()) == Some("on") && c.state.to_string() == msg)))
+}
 
 /// Paint on a card: one line of its `paint` property per stroke, "<tool> <lineSize> <filled> h,v h,v …".
 /// Journaled, so Undo takes a stroke back.
 fn add_stroke(wb: &mut World, card: u32, pts: &[(f64, f64)]) {
     if pts.is_empty() { return; }
-    let line = format!("{} {} {} {}", wb.tool.replace(' ', "_"), wb.line_size, if wb.filled { 1 } else { 0 },
-        pts.iter().map(|(x, y)| format!("{},{}", x.round() as i64, y.round() as i64)).collect::<Vec<_>>().join(" "));
-    let old = wb.get(card, "paint").text();
-    let new = if old.is_empty() { line } else { format!("{old}\n{line}") };
-    wb.set(card, "paint", Value::Str(new), false);
+    let line = Stroke { tool: wb.tool, size: wb.line_size, filled: wb.filled, pts: pts.to_vec() }.to_line();
+    wb.append_line(card, "paint", &line);
 }
 
+/// Compile `src` as the script of `id`. On error the previous working version stays live.
 fn compile_into(engine: &Engine, live: &L, id: u32, src: &str) {
     let mut lb = live.borrow_mut();
     if src.trim().is_empty() { lb.asts.remove(&id); lb.errors.remove(&id); return; }
@@ -3497,6 +3521,9 @@ pub fn hypertalk_blocks(src: &str) -> String {
         None
     }
     fn stmt(s: &str) -> String { let s = s.trim(); if s.is_empty() || s.ends_with(';') || s.ends_with('}') || s.ends_with('{') { s.to_string() } else { format!("{s};") } }
+    // A whole statement (after `then` / `else`, or on its own line): rewritten like any other (sort … of,
+    // menus, user commands). Not for the rest of a continued line, which is only part of a statement.
+    fn emit(s: &str) -> String { several_statements(s.trim()).or_else(|| rewrite_statement(s.trim())).unwrap_or_else(|| stmt(s)) }
     fn continues(t: &str) -> bool {
         let lower = t.to_lowercase();
         ["&", "+", "-", "*", "/", "=", "<", ">", ",", "(", "[", "|"].iter().any(|e| t.ends_with(e))
@@ -3551,8 +3578,8 @@ pub fn hypertalk_blocks(src: &str) -> String {
                         else {
                             last_single_if = true;
                             match find_word(after, "else") {
-                                Some(e) => format!("if {cond} {{ {} }} else {{ {} }}", stmt(&after[..e]), stmt(&after[e + 4..])),
-                                None => format!("if {cond} {{ {} }}", stmt(after)),
+                                Some(e) => format!("if {cond} {{ {} }} else {{ {} }}", emit(&after[..e]), emit(&after[e + 4..])),
+                                None => format!("if {cond} {{ {} }}", emit(after)),
                             }
                         }
                     }
@@ -3569,7 +3596,7 @@ pub fn hypertalk_blocks(src: &str) -> String {
                             let cond = rest[2..p].trim();
                             let after = rest[p + 4..].trim();
                             if !in_block || single_if_before { stack.push(B::If); }
-                            if after.is_empty() { format!("{close}else if {cond} {{") } else { format!("{close}else if {cond} {{ {}", stmt(after)) }
+                            if after.is_empty() { format!("{close}else if {cond} {{") } else { format!("{close}else if {cond} {{ {}", emit(after)) }
                         }
                         None => stmt(&t),
                     }
@@ -3577,9 +3604,9 @@ pub fn hypertalk_blocks(src: &str) -> String {
                     if !in_block || single_if_before { stack.push(B::If); }
                     format!("{close}else {{")
                 } else if !in_block || single_if_before {
-                    format!("else {{ {} }}", stmt(rest))
+                    format!("else {{ {} }}", emit(rest))
                 } else {
-                    format!("{close}else {{ {}", stmt(rest))
+                    format!("{close}else {{ {}", emit(rest))
                 }
             }
             "repeat" => {
@@ -3589,7 +3616,8 @@ pub fn hypertalk_blocks(src: &str) -> String {
                 if rest.is_empty() { "repeat {".to_string() } else { format!("repeat {rest} {{") }
             }
             // The rest of a continued line (`¬`) is never a command of its own.
-            _ => match (!was_continued).then(|| rewrite_statement(&t).or_else(|| several_statements(&t))).flatten() { Some(c) => c, None => stmt(&t) },
+            // Several statements on a line are rewritten one by one, so a user command does not swallow the rest.
+            _ => if was_continued { stmt(&t) } else { emit(&t) },
         };
         push(&mut out, line);
     }
@@ -3629,7 +3657,7 @@ const KNOWN_STATEMENT_WORDS: &[&str] = &[
     "three", "four", "five", "six", "seven", "eight", "nine", "ten", "up", "down", "lineFeed", "newline", "comma", "eof",
 ];
 
-/// Statements rewritten before compiling: sorting a container, and user commands.
+/// Statements rewritten before compiling: sorting a container, menu statements, and user commands.
 fn rewrite_statement(line: &str) -> Option<String> { sort_container(line).or_else(|| menu_statement(line)).or_else(|| user_command(line)) }
 
 /// Menu statements, as calls:
@@ -3664,14 +3692,15 @@ fn menu_statement(line: &str) -> Option<String> {
     }
 }
 
-/// A line holding several statements (`a; b; c`) where some need rewriting (`sort … of`, menus):
-/// each is rewritten on its own. None if there is nothing to rewrite.
+/// A line holding several statements (`a; b; c`) where some need rewriting (`sort … of`, menus, user
+/// commands): each is rewritten on its own. None if there is nothing to rewrite.
 fn several_statements(t: &str) -> Option<String> {
     if t.contains('{') || t.contains('}') { return None; }
     let parts = split_statements(t);
     if parts.len() < 2 && !t.trim_end().ends_with(';') { return None; }
-    if !parts.iter().any(|st| sort_container(st).or_else(|| menu_statement(st)).is_some()) { return None; }
-    Some(parts.into_iter().map(|st| sort_container(&st).or_else(|| menu_statement(&st)).unwrap_or_else(|| format!("{};", st.trim()))).collect::<Vec<_>>().join(" "))
+    let rewritten: Vec<Option<String>> = parts.iter().map(|st| rewrite_statement(st)).collect();
+    if rewritten.iter().all(Option::is_none) { return None; }
+    Some(parts.iter().zip(rewritten).map(|(st, r)| r.unwrap_or_else(|| format!("{};", st.trim()))).collect::<Vec<_>>().join(" "))
 }
 
 /// Split a line at the `;` outside quotes and brackets (empty pieces dropped).
@@ -3744,20 +3773,35 @@ fn sort_parts(text: &str, kind: &str) -> rhai::Array {
     if kind == "items" { text.split(delim().as_str()).map(|p| Dynamic::from(p.to_string())).collect() } else { text.lines().map(|p| Dynamic::from(p.to_string())).collect() }
 }
 
+/// How `sort` compares keys: `sort … numeric`, `sort … dateTime`, or as text (the default; case does not matter).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortStyle { Text, Numeric, DateTime }
+
+impl SortStyle {
+    fn from_flags(flags: &str) -> SortStyle {
+        if flags.contains("numeric") { SortStyle::Numeric } else if flags.contains("datetime") { SortStyle::DateTime } else { SortStyle::Text }
+    }
+    fn cmp(self, a: &str, b: &str) -> std::cmp::Ordering {
+        match self {
+            // Numbers in order; anything that is not a number goes after them.
+            SortStyle::Numeric => { let f = |s: &str| s.trim().parse::<f64>().unwrap_or(f64::INFINITY); f(a).total_cmp(&f(b)) }
+            SortStyle::DateTime => { let f = |s: &str| parse_when(s).unwrap_or(i64::MAX); f(a).cmp(&f(b)) }
+            SortStyle::Text => a.to_lowercase().cmp(&b.to_lowercase()),
+        }
+    }
+}
+
+/// Sort (key, value) pairs stably by key, as `sort` does: ascending unless `flags` say descending.
+fn sort_keyed<T>(keyed: &mut [(String, T)], flags: &str) {
+    let style = SortStyle::from_flags(flags);
+    let desc = flags.contains("descending");
+    keyed.sort_by(|a, b| if desc { style.cmp(&b.0, &a.0) } else { style.cmp(&a.0, &b.0) });
+}
+
 /// Sort pieces stably by their keys and join them again.
 fn sort_by_keys(parts: rhai::Array, keys: rhai::Array, kind: &str, flags: &str) -> String {
-    use std::cmp::Ordering;
     let mut keyed: Vec<(String, String)> = keys.into_iter().map(|k| k.to_string()).zip(parts.into_iter().map(|p| p.to_string())).collect();
-    let cmp: Box<dyn Fn(&String, &String) -> Ordering> = if flags.contains("numeric") {
-        // Numbers in order; anything that is not a number goes after them.
-        Box::new(|a, b| { let f = |s: &str| s.trim().parse::<f64>().unwrap_or(f64::INFINITY); f(a).partial_cmp(&f(b)).unwrap_or(Ordering::Equal) })
-    } else if flags.contains("datetime") {
-        Box::new(|a, b| { let f = |s: &str| parse_when(s).unwrap_or(i64::MAX); f(a).cmp(&f(b)) })
-    } else {
-        Box::new(|a, b| a.to_lowercase().cmp(&b.to_lowercase()))
-    };
-    let desc = flags.contains("descending");
-    keyed.sort_by(|a, b| if desc { cmp(&b.0, &a.0) } else { cmp(&a.0, &b.0) });
+    sort_keyed(&mut keyed, flags);
     let sep = if kind == "items" { delim() } else { "\n".to_string() };
     keyed.into_iter().map(|(_, p)| p).collect::<Vec<_>>().join(&sep)
 }

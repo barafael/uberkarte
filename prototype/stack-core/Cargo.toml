@@ -11,6 +11,8 @@ toml = "0.8"
 [dependencies]
 rhai = { version = "1.27", features = ["internals"] }
 serde = { version = "1", features = ["derive"] }
+smart-default = "0.7"
+strum = { version = "0.27", features = ["derive"] }
 toml = "0.8"
 web-time = "1"
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }

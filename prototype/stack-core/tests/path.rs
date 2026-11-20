@@ -897,7 +897,8 @@ fn file_io() {
     rt.exec(r#"put "hello" into file "greeting.txt"; create folder "box"; put file "greeting.txt" & "!" into field "search";"#); no_error(&rt);
     assert_eq!(field(&rt, "search"), "hello!");
     let changes = rt.w.borrow().fs.borrow_mut().take_changes();
-    assert_eq!(changes.iter().map(|c| (c.0.as_str(), c.1.as_str())).collect::<Vec<_>>(), vec![("write", "/greeting.txt"), ("folder", "/box")]);
+    use stack_core::files::FsChange;
+    assert_eq!(changes, vec![FsChange::Write { path: "/greeting.txt".into(), text: "hello".into() }, FsChange::Folder { path: "/box".into() }]);
     // answer file puts the path into it; load url / url via the cache.
     let card = rt.w.borrow().current_card();
     rt.set_script(card, r#"on urlLoaded u { put "loaded " & u & ": " & url u into field "notes"; }"#);
@@ -1150,7 +1151,7 @@ fn menus_and_domenu() {
     assert_eq!(field(&rt, "notes"), "pencil tool");
     rt.set_script(card, "on quit\n  put \"bye\" into field \"search\"\nend quit");
     rt.exec(r#"doMenu "Quit HyperCard";"#); no_error(&rt);
-    assert!(rt.w.borrow().quit_request);
+    assert_eq!(rt.w.borrow().player_requests.last(), Some(&stack_core::PlayerRequest::Quit));
     assert_eq!(field(&rt, "search"), "bye", "quit is sent before quitting");
     rt.exec(r#"doMenu "Nothing Like This";"#);
     assert!(rt.w.borrow().last_error.as_deref().unwrap_or("").contains("no menu item"));
@@ -1225,4 +1226,90 @@ fn hypertalk_precedence_and_put_to_the_message_box() {
     assert!(!rt.w.borrow().message_visible);
     rt.exec("show msg"); no_error(&rt);
     assert!(rt.w.borrow().message_visible);
+}
+
+#[test]
+fn review_regressions() {
+    // go back with lockRecent keeps the rest of the recent list; a `go` handler that takes go back keeps it all.
+    let rt = Rt::new(demo::address_book());
+    rt.exec("go to card 2"); rt.exec("go to card 3");
+    let recent: Vec<u32> = rt.w.borrow().recent.iter().copied().collect();
+    rt.exec("set the lockRecent to true; go back;"); no_error(&rt);
+    assert_eq!(rt.w.borrow().recent.iter().copied().collect::<Vec<_>>(), recent[..1].to_vec());
+    let rt = Rt::new(demo::address_book());
+    rt.exec("go to card 2"); rt.exec("go to card 3");
+    let recent: Vec<u32> = rt.w.borrow().recent.iter().copied().collect();
+    let stack = rt.w.borrow().stack_id();
+    rt.set_script(stack, "on go x\nend go");
+    rt.exec("go back"); no_error(&rt);
+    assert_eq!(rt.w.borrow().recent.iter().copied().collect::<Vec<_>>(), recent);
+    // Several statements on a line: each user command is its own message.
+    let rt = Rt::new(demo::address_book());
+    let card = rt.w.borrow().current_card();
+    rt.set_script(card, "on mouseUp\n  greet 1; greet 2\nend mouseUp\non greet x\n  put x after field \"search\"\nend greet");
+    assert_eq!(rt.script_error(card), None);
+    rt.send(card, "mouseUp"); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "12");
+    // Home by name is the Home stack itself; a pending visual effect goes with `go to stack`.
+    let rt = Rt::with_home(demo::address_book(), Some(demo::home()));
+    rt.exec(r#"put the name of stack "Home" into field "search"; visual effect dissolve; go to stack "Pillars";"#); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "Home");
+    assert_eq!(rt.w.borrow().go_stack.as_ref().and_then(|g| g.effect.as_deref()), Some("dissolve"));
+    // delete card <variable> and delete card id <n>.
+    let rt = Rt::new(demo::address_book());
+    let id = rt.w.borrow().cards()[2];
+    rt.exec(&format!("put 2 into n; delete card n; delete card id {id}")); no_error(&rt);
+    assert_eq!(rt.w.borrow().cards().len(), 1);
+    // exit to something other than HyperCard is an error, not a quiet exit.
+    rt.exec("exit to nowhere");
+    assert!(rt.w.borrow().last_error.as_deref().unwrap_or("").contains("exit to HyperCard"));
+    // idle goes only to a script with an idle handler, not one that mentions the word.
+    let card = rt.w.borrow().current_card();
+    rt.set_script(card, "on mouseUp\n  -- not idle\nend mouseUp");
+    assert!(!rt.idle());
+    // The in-memory disk: a binary file can be replaced by text, renamed and deleted; a folder with one is not empty.
+    use stack_core::files::{Fs, MemFs};
+    let mut fs = MemFs::new();
+    fs.write_bytes("/d/a.stack", b"PK\x03\x04\xff").unwrap();
+    assert!(fs.delete("/d").is_err());
+    fs.rename("/d/a.stack", "/d/b.stack").unwrap();
+    assert_eq!(fs.read_bytes("/d/b.stack").unwrap(), b"PK\x03\x04\xff");
+    fs.write("/d/b.stack", "text").unwrap();
+    assert_eq!(fs.read_bytes("/d/b.stack").unwrap(), b"text");
+    fs.delete("/d/b.stack").unwrap();
+    assert!(!fs.is_file("/d/b.stack"));
+}
+
+#[test]
+fn one_line_if_statements_are_rewritten_and_strokes_round_trip() {
+    let rt = Rt::new(demo::address_book());
+    let card = rt.w.borrow().current_card();
+    rt.set_script(card, "on check what, ok\n  put what after field \"search\"\nend check\non go2\n  put \"b,a\" into v\n  if true then sort items of v\n  put v into field \"notes\"\n  if false then beep else check \"x\", true\n  if true then doMenu \"Next\"\nend go2");
+    assert_eq!(rt.script_error(card), None);
+    rt.exec("put empty into field \"search\"");
+    rt.send(card, "go2"); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "x");
+    assert_eq!(rt.w.borrow().card_number(rt.w.borrow().current_card()), 2);
+    rt.exec("go prev"); no_error(&rt);
+    assert_eq!(field(&rt, "notes"), "a,b", "notes is per card: read it on card 1");
+    // A menu item whose name holds a quote mark reaches doMenu intact.
+    rt.exec("create menu \"Q\"\nput \"Say \" & quote & \"hi\" & quote into menu \"Q\"");
+    let here = rt.w.borrow().current_card();
+    rt.set_script(here, "on doMenu what\n  put what into field \"search\"\nend doMenu");
+    rt.do_menu("Say \"hi\"", "Q"); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "Say \"hi\"");
+    // Strokes: one journal entry per stroke, not the whole paint each time.
+    let s = stack_core::Stroke { tool: stack_core::Tool::RoundRect, size: 2, filled: true, pts: vec![(1.0, 2.0), (3.0, 4.0)] };
+    assert_eq!(s.to_line(), "round_rect 2 1 1,2 3,4");
+    assert_eq!(stack_core::Stroke::parse(&s.to_line()), Some(s));
+    rt.exec("set the userLevel to 3\nchoose pencil tool");
+    for i in 0..3 { rt.paint(&[(i as f64, 0.0)]); }
+    let w = rt.w.borrow();
+    let card = w.current_card();
+    assert_eq!(stack_core::Stroke::parse_all(&w.get(card, "paint").text()).len(), 3);
+    assert!(w.file.journal.iter().rev().take(3).all(|c| c.kind == stack_core::ChangeKind::Append && c.new.as_ref().map(|v| v.text().len()) < Some(20)));
+    drop(w);
+    rt.exec("choose select tool");
+    rt.paint(&[(1.0, 1.0)]);
+    assert_eq!(stack_core::Stroke::parse_all(&rt.w.borrow().get(card, "paint").text()).len(), 3, "select leaves no stroke");
 }

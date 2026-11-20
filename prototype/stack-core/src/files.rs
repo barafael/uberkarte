@@ -15,11 +15,18 @@ pub trait Fs {
     fn is_folder(&self, path: &str) -> bool;
     /// (files, folders) directly inside `path`, names only, sorted.
     fn list(&self, path: &str) -> Result<(Vec<String>, Vec<String>), String>;
-    /// Changes since the last call, for mirroring (web): ("write", path, text), ("delete", path, ""),
-    /// ("folder", path, ""). The real file system returns nothing.
-    fn take_changes(&mut self) -> Vec<(String, String, String)> { vec![] }
+    /// Changes since the last call, for mirroring (web). The real file system returns nothing.
+    fn take_changes(&mut self) -> Vec<FsChange> { vec![] }
     /// Restore a file (Some(text)) or folder (None) from browser storage, without recording a change.
     fn preload(&mut self, _path: &str, _text: Option<&str>) {}
+}
+
+/// A change to the in-memory disk, for the player to mirror to browser storage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FsChange {
+    Write { path: String, text: String },
+    Delete { path: String },
+    Folder { path: String },
 }
 
 /// Join a relative path onto a base folder; absolute paths (`/…`, `C:\…`, `~/…`) are kept.
@@ -37,12 +44,12 @@ pub fn resolve_path(base: &str, path: &str) -> String {
 }
 
 /// The browser-side disk: everything in memory, changes queued for the player to persist.
+/// Text files are mirrored; binary files (`write_bytes`) last for the session only.
 #[derive(Default)]
 pub struct MemFs {
-    files: BTreeMap<String, String>,
-    binaries: BTreeMap<String, Vec<u8>>,
+    files: BTreeMap<String, Vec<u8>>,
     folders: std::collections::BTreeSet<String>,
-    changes: Vec<(String, String, String)>,
+    changes: Vec<FsChange>,
 }
 
 impl MemFs {
@@ -51,7 +58,7 @@ impl MemFs {
     pub fn preload(&mut self, path: &str, text: &str) {
         let p = resolve_path("/", path);
         self.add_parents(&p);
-        self.files.insert(p, text.to_string());
+        self.files.insert(p, text.as_bytes().to_vec());
     }
     fn add_parents(&mut self, p: &str) {
         let mut cur = String::new();
@@ -59,66 +66,66 @@ impl MemFs {
         for s in &segs[..segs.len().saturating_sub(1)] { cur = format!("{cur}/{s}"); self.folders.insert(cur.clone()); }
     }
     fn key(path: &str) -> String { resolve_path("/", path) }
+    /// Store a file's bytes (not a change to mirror); returns its key.
+    fn put(&mut self, path: &str, bytes: &[u8]) -> Result<String, String> {
+        let k = Self::key(path);
+        if self.folders.contains(&k) { return Err(format!("\"{path}\" is a folder")); }
+        self.add_parents(&k);
+        self.files.insert(k.clone(), bytes.to_vec());
+        Ok(k)
+    }
 }
 
 impl Fs for MemFs {
-    fn read(&self, path: &str) -> Result<String, String> { self.files.get(&Self::key(path)).cloned().ok_or_else(|| format!("no file \"{path}\"")) }
-    fn read_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
-        if let Some(b) = self.binaries.get(&Self::key(path)) { return Ok(b.clone()); }
-        self.read(path).map(|s| s.into_bytes())
+    fn read(&self, path: &str) -> Result<String, String> {
+        String::from_utf8(self.read_bytes(path)?).map_err(|_| format!("\"{path}\" is not a text file"))
     }
-    fn write_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
-        let k = Self::key(path);
-        if self.folders.contains(&k) { return Err(format!("\"{path}\" is a folder")); }
-        self.add_parents(&k);
-        self.files.remove(&k);
-        self.binaries.insert(k, bytes.to_vec());
-        Ok(())
-    }
+    fn read_bytes(&self, path: &str) -> Result<Vec<u8>, String> { self.files.get(&Self::key(path)).cloned().ok_or_else(|| format!("no file \"{path}\"")) }
+    fn write_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> { self.put(path, bytes).map(|_| ()) }
     fn write(&mut self, path: &str, text: &str) -> Result<(), String> {
-        let k = Self::key(path);
-        if self.folders.contains(&k) { return Err(format!("\"{path}\" is a folder")); }
-        self.add_parents(&k);
-        self.files.insert(k.clone(), text.to_string());
-        self.changes.push(("write".into(), k, text.to_string()));
+        let path = self.put(path, text.as_bytes())?;
+        self.changes.push(FsChange::Write { path, text: text.to_string() });
         Ok(())
     }
     fn delete(&mut self, path: &str) -> Result<(), String> {
         let k = Self::key(path);
-        if self.files.remove(&k).is_some() { self.changes.push(("delete".into(), k, String::new())); return Ok(()); }
+        if self.files.remove(&k).is_some() { self.changes.push(FsChange::Delete { path: k }); return Ok(()); }
         if self.folders.contains(&k) {
-            if self.files.keys().any(|f| f.starts_with(&format!("{k}/"))) { return Err(format!("folder \"{path}\" is not empty")); }
+            let inside = format!("{k}/");
+            if self.files.keys().chain(self.folders.iter()).any(|f| f.starts_with(&inside)) { return Err(format!("folder \"{path}\" is not empty")); }
             self.folders.remove(&k);
-            self.changes.push(("delete".into(), k, String::new()));
+            self.changes.push(FsChange::Delete { path: k });
             return Ok(());
         }
         Err(format!("no file \"{path}\""))
     }
     fn rename(&mut self, from: &str, to: &str) -> Result<(), String> {
-        let text = self.read(from)?;
+        let bytes = self.read_bytes(from)?;
         if self.is_file(to) { return Err(format!("\"{to}\" already exists")); }
-        self.write(to, &text)?;
+        match String::from_utf8(bytes) {
+            Ok(text) => self.write(to, &text)?,
+            Err(e) => self.write_bytes(to, e.as_bytes())?,
+        }
         self.delete(from)
     }
     fn create_folder(&mut self, path: &str) -> Result<(), String> {
         let k = Self::key(path);
         self.add_parents(&format!("{k}/x"));
-        self.changes.push(("folder".into(), k, String::new()));
+        self.changes.push(FsChange::Folder { path: k });
         Ok(())
     }
-    fn is_file(&self, path: &str) -> bool { let k = Self::key(path); self.files.contains_key(&k) || self.binaries.contains_key(&k) }
+    fn is_file(&self, path: &str) -> bool { self.files.contains_key(&Self::key(path)) }
     fn is_folder(&self, path: &str) -> bool { let k = Self::key(path); k == "/" || self.folders.contains(&k) }
     fn list(&self, path: &str) -> Result<(Vec<String>, Vec<String>), String> {
         let k = Self::key(path);
         if !self.is_folder(&k) { return Err(format!("no folder \"{path}\"")); }
         let prefix = if k == "/" { "/".to_string() } else { format!("{k}/") };
         let direct = |p: &String| p.starts_with(&prefix) && !p[prefix.len()..].contains('/');
-        let mut files: Vec<String> = self.files.keys().chain(self.binaries.keys()).filter(|p| direct(p)).map(|p| p[prefix.len()..].to_string()).collect();
-        files.sort();
+        let files = self.files.keys().filter(|p| direct(p)).map(|p| p[prefix.len()..].to_string()).collect();
         let folders = self.folders.iter().filter(|p| direct(p) && p.len() > prefix.len()).map(|p| p[prefix.len()..].to_string()).collect();
         Ok((files, folders))
     }
-    fn take_changes(&mut self) -> Vec<(String, String, String)> { std::mem::take(&mut self.changes) }
+    fn take_changes(&mut self) -> Vec<FsChange> { std::mem::take(&mut self.changes) }
     fn preload(&mut self, path: &str, text: Option<&str>) {
         match text {
             Some(t) => MemFs::preload(self, path, t),
@@ -145,11 +152,7 @@ impl NativeFs {
 impl Fs for NativeFs {
     fn read(&self, path: &str) -> Result<String, String> { std::fs::read_to_string(Self::p(path)).map_err(|e| format!("{path}: {e}")) }
     fn read_bytes(&self, path: &str) -> Result<Vec<u8>, String> { std::fs::read(Self::p(path)).map_err(|e| format!("{path}: {e}")) }
-    fn write(&mut self, path: &str, text: &str) -> Result<(), String> {
-        let p = Self::p(path);
-        if let Some(d) = p.parent() { if !d.as_os_str().is_empty() { std::fs::create_dir_all(d).map_err(|e| format!("{path}: {e}"))?; } }
-        std::fs::write(p, text).map_err(|e| format!("{path}: {e}"))
-    }
+    fn write(&mut self, path: &str, text: &str) -> Result<(), String> { self.write_bytes(path, text.as_bytes()) }
     fn delete(&mut self, path: &str) -> Result<(), String> {
         let p = Self::p(path);
         if p.is_dir() { std::fs::remove_dir(p) } else { std::fs::remove_file(p) }.map_err(|e| format!("{path}: {e}"))

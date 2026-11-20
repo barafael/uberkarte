@@ -38,11 +38,31 @@ pub struct Obj {
     pub props: BTreeMap<String, Value>,
 }
 
-/// One journal entry. `kind` is "set", "create" or "delete". Entries with the same `txn` undo together.
+/// What a journal entry did. Written to the stack file in lowercase ("set", "create", …).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeKind {
+    /// A property written (`key`, `old`, `new`).
+    Set,
+    /// An object made (`snapshot`, `index`).
+    Create,
+    /// An object removed (`snapshot`, `index`).
+    Delete,
+    /// A card moved to another background (`old`, `new` are background ids).
+    Parent,
+    /// A picture or sound added (`key` is its name).
+    Asset,
+    /// The cards put in a new order (`key` is the old order).
+    Order,
+    /// A line added to the end of a text property (`key`, the line in `new`): one paint stroke.
+    Append,
+}
+
+/// One journal entry. Entries with the same `txn` undo together.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Change {
     pub txn: u64,
-    pub kind: String,
+    pub kind: ChangeKind,
     pub obj: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub key: String,
@@ -70,12 +90,17 @@ pub enum Shape {
     Text { x: f64, y: f64, text: String, color: String },
 }
 
+/// What an asset holds. Written as "picture" / "sound".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum AssetKind { Picture, Sound }
+
 /// A picture or sound stored in the stack's zip container under `file`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Asset {
     pub name: String,
-    /// "picture" or "sound".
-    pub kind: String,
+    pub kind: AssetKind,
     pub file: String,
     pub mime: String,
 }
@@ -179,10 +204,10 @@ impl StackFile {
 
     /// Add or replace a picture or sound. Returns the stored asset.
     pub fn add_asset(&mut self, name: &str, mime: &str, bytes: Vec<u8>) -> Asset {
-        let kind = if mime.starts_with("audio") { "sound" } else { "picture" };
+        let kind = if mime.starts_with("audio") { AssetKind::Sound } else { AssetKind::Picture };
         let ext = mime.rsplit('/').next().unwrap_or("bin").split('+').next().unwrap_or("bin").replace("mpeg", "mp3").replace("x-wav", "wav");
         let safe: String = name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-        let a = Asset { name: name.into(), kind: kind.into(), file: format!("assets/{kind}s/{safe}.{ext}"), mime: mime.into() };
+        let a = Asset { name: name.into(), kind, file: format!("assets/{kind}s/{safe}.{ext}"), mime: mime.into() };
         self.assets.retain(|x| x.name != name);
         self.assets.push(a.clone());
         self.blobs.insert(name.into(), bytes);
@@ -235,7 +260,9 @@ pub fn migrate_joins(script: &str) -> String {
 }
 
 /// Runtime view of a stack. All mutations go through `set`, `create`, `delete`, so all are journaled.
+#[derive(smart_default::SmartDefault)]
 pub struct World {
+    #[default(StackFile::new("", 0, 0))]
     pub file: StackFile,
     pub log: Vec<String>,
     pub dialog: Option<String>,
@@ -246,7 +273,7 @@ pub struct World {
     pub mouse: (f64, f64),
     pub keys: std::collections::BTreeSet<String>,
     /// Draw lists, one per canvas part on the current card.
-    pub draw: std::collections::HashMap<u32, Vec<Shape>>,
+    pub draw: std::rc::Rc<std::collections::HashMap<u32, Vec<Shape>>>,
     /// The Home stack's object (id 0): last stop on every message path, shared by all stacks.
     pub home: Option<Obj>,
     /// The sound playing now (`the sound`), and commands waiting for the player.
@@ -257,6 +284,7 @@ pub struct World {
     pub effect_seq: u64,
     pub locked: bool,
     /// HyperTalk's global properties and functions that are runtime state, not saved.
+    #[default(",".into())]
     pub item_delim: String,
     pub lock_messages: bool,
     pub result: String,
@@ -279,18 +307,20 @@ pub struct World {
     /// The field being typed into (for `type`), set when a field gets focus.
     pub focused: Option<u32>,
     /// HyperCard's user level: 1 browsing, 2 typing, 3 painting, 4 authoring, 5 scripting.
+    #[default(5)]
     pub user_level: i64,
     /// Files: the file system, the folder relative paths start from (the stack's folder), and open files.
+    #[default(std::rc::Rc::new(std::cell::RefCell::new(crate::files::default_fs())))]
     pub fs: std::rc::Rc<std::cell::RefCell<Box<dyn crate::files::Fs>>>,
     pub fs_base: String,
-    pub open_files: std::collections::HashMap<String, OpenFile>,
+    pub open_files: std::rc::Rc<std::collections::HashMap<String, OpenFile>>,
     /// `answer file` (false) / `ask file` (true): a file dialog over this folder.
     pub dialog_file: Option<(bool, String)>,
     /// `load url`: requests for the player, (url, object to tell), and what has arrived.
     pub url_requests: Vec<(String, u32)>,
     pub url_cache: std::collections::HashMap<String, String>,
     /// Stacks in use as libraries (their stack objects; their scripts sit between this stack and Home).
-    pub libs: Vec<Obj>,
+    pub libs: std::rc::Rc<Vec<Obj>>,
     /// `go to stack …`: for the player. The stacks folder to search, and the stacks open in the player.
     pub go_stack: Option<GoStack>,
     pub stacks_dir: String,
@@ -309,27 +339,28 @@ pub struct World {
     pub journal_floor: usize,
     pub floor_merges: Vec<(usize, Option<Value>)>,
     /// Other stacks named by scripts (ids VISIT0, VISIT0 + 1, …).
-    pub visited: Vec<Obj>,
+    pub visited: std::rc::Rc<Vec<Obj>>,
     /// `visual effect …`: the effect for the next `go` in this run.
     pub visual: Option<String>,
-    /// HyperCard's tool: "browse", "button", "field", or a paint tool ("pencil", "round rect", …).
-    pub tool: String,
+    /// HyperCard's tool: browse, button, field, or a paint tool.
+    pub tool: Tool,
     /// Paint settings: line width for lines and shapes, and whether shapes are filled.
+    #[default(1)]
     pub line_size: i64,
     pub filled: bool,
     /// The menu bar: built-in menus first, then those scripts create. Not saved, as in HyperCard.
-    pub menus: Vec<Menu>,
-    /// Cards visited, for `go back` (unless lockRecent).
-    pub recent: Vec<u32>,
+    #[default(std::rc::Rc::new(default_menus()))]
+    pub menus: std::rc::Rc<Vec<Menu>>,
+    /// Cards visited, for `go back` (unless lockRecent), oldest first, at most RECENT_MAX.
+    pub recent: std::collections::VecDeque<u32>,
     pub lock_recent: bool,
     /// The player's window: viewport size and screen position (for the screenRect, sizeWindow, moveWindow).
     pub screen: (f64, f64),
     pub window_loc: (f64, f64),
-    /// Requests for the player from the built-in menu items: Undo, focus the message box, quit.
-    pub undo_request: bool,
-    pub message_request: bool,
-    pub quit_request: bool,
+    /// Requests for the player from the built-in menu items, in order.
+    pub player_requests: Vec<PlayerRequest>,
     /// `hide message box` / `show message box`.
+    #[default(true)]
     pub message_visible: bool,
 }
 
@@ -381,24 +412,87 @@ pub fn default_menus() -> Vec<Menu> {
     ]
 }
 
-/// The paint tools, in HyperCard's order (tool 6 to 18), and the user level they need.
-pub const TOOLS: [&str; 18] = ["browse", "button", "field", "select", "lasso", "pencil", "brush", "eraser", "line", "spray",
-    "rectangle", "round rect", "bucket", "oval", "curve", "text", "regular polygon", "polygon"];
+/// HyperCard's tools, in its order (`choose tool 1` is browse, 6 is pencil, …). Names are HyperTalk's
+/// (`choose round rect tool`); `round_rect` is how a stroke in a card's `paint` names its tool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, strum::Display, strum::EnumString, strum::VariantArray)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum Tool {
+    #[default]
+    Browse, Button, Field, Select, Lasso, Pencil, Brush, Eraser, Line, Spray,
+    #[strum(to_string = "rectangle", serialize = "rect")]
+    Rectangle,
+    #[strum(to_string = "round rect", serialize = "round_rect", serialize = "roundrect", serialize = "round rectangle")]
+    RoundRect,
+    Bucket, Oval, Curve, Text,
+    #[strum(to_string = "regular polygon", serialize = "regular_polygon")]
+    RegularPolygon,
+    Polygon,
+}
+
+impl Tool {
+    /// Every tool, in HyperCard's order.
+    pub fn all() -> &'static [Tool] { <Tool as strum::VariantArray>::VARIANTS }
+    /// `choose tool n`: 1 to 18.
+    pub fn from_number(n: i64) -> Option<Tool> { usize::try_from(n).ok()?.checked_sub(1).and_then(|i| Tool::all().get(i)).copied() }
+    /// The user level a tool needs: browsing 1, painting 3, the button and field tools (authoring) 4.
+    pub fn user_level(self) -> i64 { match self { Tool::Browse => 1, Tool::Button | Tool::Field => 4, _ => 3 } }
+    /// The button and field tools edit parts (the player's edit mode).
+    pub fn edits_parts(self) -> bool { matches!(self, Tool::Button | Tool::Field) }
+    /// A paint tool: the card is for painting.
+    pub fn is_paint(self) -> bool { !matches!(self, Tool::Browse | Tool::Button | Tool::Field) }
+    /// A paint tool that leaves a stroke here (selecting, lassoing, filling and text do not yet).
+    pub fn strokes(self) -> bool { self.is_paint() && !matches!(self, Tool::Select | Tool::Lasso | Tool::Bucket | Tool::Text) }
+    /// The name a stroke in a card's `paint` uses: one word.
+    pub fn paint_name(self) -> String { self.to_string().replace(' ', "_") }
+}
+
+/// One paint stroke on a card. A card's `paint` property holds one per line:
+/// "<tool> <lineSize> <filled 0|1> h,v h,v …" (the tool as one word, e.g. `round_rect`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stroke { pub tool: Tool, pub size: i64, pub filled: bool, pub pts: Vec<(f64, f64)> }
+
+impl Stroke {
+    pub fn to_line(&self) -> String {
+        let pts = self.pts.iter().map(|(x, y)| format!("{},{}", x.round() as i64, y.round() as i64)).collect::<Vec<_>>().join(" ");
+        format!("{} {} {} {pts}", self.tool.paint_name(), self.size, u8::from(self.filled))
+    }
+    pub fn parse(line: &str) -> Option<Stroke> {
+        let mut it = line.split_whitespace();
+        let tool = it.next()?.parse().ok()?;
+        let size = it.next()?.parse().ok()?;
+        let filled = it.next()? == "1";
+        let pts = it.filter_map(|p| p.split_once(',')).filter_map(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?))).collect();
+        Some(Stroke { tool, size, filled, pts })
+    }
+    /// The strokes of a `paint` property, skipping lines that do not read as one.
+    pub fn parse_all(paint: &str) -> Vec<Stroke> { paint.lines().filter_map(Stroke::parse).collect() }
+}
+
+/// What a script asked the player to do from a built-in menu item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayerRequest { Undo, FocusMessageBox, Quit }
+
+/// How many cards `go back` remembers.
+pub const RECENT_MAX: usize = 200;
 
 /// A request for the player: show another stack (`go to stack …`), in this tab or a new one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GoStack { pub path: String, pub card: Option<Value>, pub new_window: bool, pub effect: Option<String> }
 
 impl World {
-    pub fn new(file: StackFile) -> Self { World { file, log: vec![], dialog: None, last_error: None, auto_depth: 0, mouse: (0.0, 0.0), keys: Default::default(), draw: Default::default(), home: None, sound: None, sound_cmds: vec![], effect: None, effect_seq: 0, locked: false,
-        item_delim: ",".into(), lock_messages: false, result: String::new(), mouse_down: false, click_loc: (0.0, 0.0),
-        dialog_buttons: vec![], dialog_ask: None, timers: vec![], push_list: vec![], edit_request: None, hover: None, pressed: None,
-        selection: None, select_request: None, focused: None, user_level: 5, tz_offset_min: 0, mouse_click: false, click_text_at: None,
-        fs: std::rc::Rc::new(std::cell::RefCell::new(crate::files::default_fs())), fs_base: String::new(), open_files: Default::default(),
-        dialog_file: None, url_requests: vec![], url_cache: Default::default(),
-        libs: vec![], go_stack: None, stacks_dir: String::new(), open_stacks: vec![], journal_floor: 0, floor_merges: vec![], visited: vec![], visual: None,
-        tool: "browse".into(), line_size: 1, filled: false, menus: default_menus(), recent: vec![], lock_recent: false,
-        screen: (0.0, 0.0), window_loc: (0.0, 0.0), undo_request: false, message_request: false, quit_request: false, message_visible: true } }
+    pub fn new(file: StackFile) -> Self { World { file, ..Default::default() } }
+
+    /// The menu with this name (any case).
+    pub fn menu(&self, name: &str) -> Result<&Menu, String> {
+        self.menus.iter().find(|m| m.name.eq_ignore_ascii_case(name)).ok_or_else(|| format!("no menu \"{name}\""))
+    }
+    /// The menu with this name, to change (the menu bar is shared with snapshots until written).
+    pub fn menu_mut(&mut self, name: &str) -> Result<&mut Menu, String> {
+        std::rc::Rc::make_mut(&mut self.menus).iter_mut().find(|m| m.name.eq_ignore_ascii_case(name)).ok_or_else(|| format!("no menu \"{name}\""))
+    }
+
+    /// A part's rectangle: left, top, width, height.
+    pub fn rect(&self, id: u32) -> [i64; 4] { ["left", "top", "width", "height"].map(|k| self.get(id, k).int()) }
 
     /// Find a stack file by name or path: the stack's own folder, then the stacks folder, then the search
     /// folders kept in Home (`the searchPaths`, one per line). `Name` also matches `Name.stack`.
@@ -429,7 +523,7 @@ impl World {
         for (slot, id) in slots.iter().zip(order) { self.file.objs[*slot] = by_id[id].clone(); }
         let key = old.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
         let auto = self.auto_depth > 0;
-        self.file.journal.push(Change { txn: self.file.txn, kind: "order".into(), obj: 0, key, old: None, new: None, index: None, snapshot: None, auto });
+        self.file.journal.push(Change { txn: self.file.txn, kind: ChangeKind::Order, obj: 0, key, old: None, new: None, index: None, snapshot: None, auto });
     }
 
     pub fn set_effect(&mut self, name: &str) {
@@ -460,7 +554,7 @@ impl World {
         if id == HOME { self.home.as_ref() } else if id >= VISIT0 { self.visited.get((id - VISIT0) as usize) } else if id >= LIB0 { self.libs.get((id - LIB0) as usize) } else { self.file.objs.iter().find(|o| o.id == id) }
     }
     fn obj_mut(&mut self, id: u32) -> Option<&mut Obj> {
-        if id == HOME { self.home.as_mut() } else if id >= VISIT0 { self.visited.get_mut((id - VISIT0) as usize) } else if id >= LIB0 { self.libs.get_mut((id - LIB0) as usize) } else { self.file.objs.iter_mut().find(|o| o.id == id) }
+        if id == HOME { self.home.as_mut() } else if id >= VISIT0 { std::rc::Rc::make_mut(&mut self.visited).get_mut((id - VISIT0) as usize) } else if id >= LIB0 { std::rc::Rc::make_mut(&mut self.libs).get_mut((id - LIB0) as usize) } else { self.file.objs.iter_mut().find(|o| o.id == id) }
     }
     pub fn stack_id(&self) -> u32 { self.file.objs.iter().find(|o| o.kind == Kind::Stack).map(|o| o.id).unwrap_or(0) }
     pub fn cards(&self) -> Vec<u32> { self.file.objs.iter().filter(|o| o.kind == Kind::Card).map(|o| o.id).collect() }
@@ -506,8 +600,8 @@ impl World {
                 _ => self.file.objs.iter().filter(|x| x.kind == o.kind && x.parent == o.parent).position(|x| x.id == id).map(|i| i as i64 + 1).unwrap_or(0),
             }),
             "text" => { let (oid, k) = self.text_slot(id); self.obj(oid).and_then(|x| x.props.get(&k)).cloned().unwrap_or(Value::Str(String::new())) }
-            "rect" => { let r = ["left", "top", "width", "height"].map(|k| self.get(id, k).int()); Value::Str(format!("{},{},{},{}", r[0], r[1], r[0] + r[2], r[1] + r[3])) }
-            "loc" => { let r = ["left", "top", "width", "height"].map(|k| self.get(id, k).int()); Value::Str(format!("{},{}", r[0] + r[2] / 2, r[1] + r[3] / 2)) }
+            "rect" => { let r = self.rect(id); Value::Str(format!("{},{},{},{}", r[0], r[1], r[0] + r[2], r[1] + r[3])) }
+            "loc" => { let r = self.rect(id); Value::Str(format!("{},{}", r[0] + r[2] / 2, r[1] + r[3] / 2)) }
             "owner" => o.parent.and_then(|p| self.obj(p)).map(|p| Value::Str(p.name.clone())).unwrap_or(Value::Str(String::new())),
             "visible" | "enabled" | "showName" | "autoHilite" | "showPict" => o.props.get(key).cloned().unwrap_or(Value::Bool(true)),
             "hilite" | "marked" | "locked" | "sharedText" | "dontWrap" | "dontSearch" => o.props.get(key).cloned().unwrap_or(Value::Bool(false)),
@@ -532,13 +626,24 @@ impl World {
         if merge || auto {
             let below_floor = self.file.journal.len() <= self.journal_floor;
             if let Some(last) = self.file.journal.last_mut() {
-                if last.kind == "set" && last.obj == oid && last.key == k && last.auto == auto {
+                if last.kind == ChangeKind::Set && last.obj == oid && last.key == k && last.auto == auto {
                     if below_floor { let i = self.file.journal.len() - 1; let prev = self.file.journal[i].new.clone(); self.floor_merges.push((i, prev)); self.file.journal[i].new = Some(new); return; }
                     last.new = Some(new); return;
                 }
             }
         }
-        self.file.journal.push(Change { txn, kind: "set".into(), obj: oid, key: k, old, new: Some(new), index: None, snapshot: None, auto });
+        self.file.journal.push(Change { txn, kind: ChangeKind::Set, obj: oid, key: k, old, new: Some(new), index: None, snapshot: None, auto });
+    }
+
+    /// Add a line to the end of a text property, journaling only the line (paint strokes: a card with many
+    /// strokes does not copy all of them into the journal for each new one).
+    pub fn append_line(&mut self, id: u32, key: &str, line: &str) {
+        let old = self.raw_get(id, key).map(|v| v.text()).unwrap_or_default();
+        let new = if old.is_empty() { line.to_string() } else { format!("{old}\n{line}") };
+        self.raw_set(id, key, Some(Value::Str(new)));
+        if id == HOME || id >= LIB0 { return; }
+        let auto = self.auto_depth > 0;
+        self.file.journal.push(Change { txn: self.file.txn, kind: ChangeKind::Append, obj: id, key: key.into(), old: None, new: Some(Value::Str(line.into())), index: None, snapshot: None, auto });
     }
 
     fn raw_get(&self, id: u32, key: &str) -> Option<Value> {
@@ -562,7 +667,7 @@ impl World {
         let index = after.and_then(|a| self.file.objs.iter().position(|o| o.id == a)).map(|i| i + 1).unwrap_or(self.file.objs.len());
         self.file.objs.insert(index, obj.clone());
         let auto = self.auto_depth > 0;
-        self.file.journal.push(Change { txn: self.file.txn, kind: "create".into(), obj: id, key: String::new(), old: None, new: None, index: Some(index), snapshot: Some(obj), auto });
+        self.file.journal.push(Change { txn: self.file.txn, kind: ChangeKind::Create, obj: id, key: String::new(), old: None, new: None, index: Some(index), snapshot: Some(obj), auto });
         id
     }
 
@@ -573,7 +678,7 @@ impl World {
         if let Some(index) = self.file.objs.iter().position(|o| o.id == id) {
             let obj = self.file.objs.remove(index);
             let auto = self.auto_depth > 0;
-            self.file.journal.push(Change { txn: self.file.txn, kind: "delete".into(), obj: id, key: String::new(), old: None, new: None, index: Some(index), snapshot: Some(obj), auto });
+            self.file.journal.push(Change { txn: self.file.txn, kind: ChangeKind::Delete, obj: id, key: String::new(), old: None, new: None, index: Some(index), snapshot: Some(obj), auto });
         }
         if self.file.current_card == id { self.file.current_card = self.cards().first().copied().unwrap_or(0); }
     }
@@ -601,7 +706,7 @@ impl World {
         if old == bg || self.obj(bg).map(|o| o.kind) != Some(Kind::Background) { return; }
         if let Some(o) = self.obj_mut(card) { o.parent = Some(bg); }
         let auto = self.auto_depth > 0;
-        self.file.journal.push(Change { txn: self.file.txn, kind: "parent".into(), obj: card, key: String::new(), old: Some(Value::Int(old as i64)), new: Some(Value::Int(bg as i64)), index: None, snapshot: None, auto });
+        self.file.journal.push(Change { txn: self.file.txn, kind: ChangeKind::Parent, obj: card, key: String::new(), old: Some(Value::Int(old as i64)), new: Some(Value::Int(bg as i64)), index: None, snapshot: None, auto });
     }
 
     /// Copy a part (offset a little) or a card (with its own parts, placed after it).
@@ -687,7 +792,7 @@ impl World {
     pub fn add_asset(&mut self, name: &str, mime: &str, bytes: Vec<u8>) {
         let a = self.file.add_asset(name, mime, bytes);
         let auto = self.auto_depth > 0;
-        self.file.journal.push(Change { txn: self.file.txn, kind: "asset".into(), obj: 0, key: a.name, old: None, new: None, index: None, snapshot: None, auto });
+        self.file.journal.push(Change { txn: self.file.txn, kind: ChangeKind::Asset, obj: 0, key: a.name, old: None, new: None, index: None, snapshot: None, auto });
     }
 
     pub fn new_card(&mut self) -> u32 {
@@ -735,13 +840,18 @@ impl World {
     }
 
     fn revert(&mut self, c: Change, recompile: &mut Vec<u32>) {
-        match c.kind.as_str() {
-            "set" => { self.raw_set(c.obj, &c.key, c.old); if c.key == "script" { recompile.push(c.obj); } }
-            "create" => { self.file.objs.retain(|o| o.id != c.obj); recompile.push(c.obj); }
-            "delete" => if let Some(o) = c.snapshot { let i = c.index.unwrap_or(0).min(self.file.objs.len()); self.file.objs.insert(i, o); recompile.push(c.obj); }
-            "parent" => { let old = c.old.map(|v| v.int() as u32); if let Some(o) = self.obj_mut(c.obj) { o.parent = old; } }
-            "asset" => { self.file.assets.retain(|a| a.name != c.key); self.file.blobs.remove(&c.key); }
-            "order" => {
+        match c.kind {
+            ChangeKind::Set => { self.raw_set(c.obj, &c.key, c.old); if c.key == "script" { recompile.push(c.obj); } }
+            ChangeKind::Create => { self.file.objs.retain(|o| o.id != c.obj); recompile.push(c.obj); }
+            ChangeKind::Delete => if let Some(o) = c.snapshot { let i = c.index.unwrap_or(0).min(self.file.objs.len()); self.file.objs.insert(i, o); recompile.push(c.obj); }
+            ChangeKind::Parent => { let old = c.old.map(|v| v.int() as u32); if let Some(o) = self.obj_mut(c.obj) { o.parent = old; } }
+            ChangeKind::Asset => { self.file.assets.retain(|a| a.name != c.key); self.file.blobs.remove(&c.key); }
+            ChangeKind::Append => {
+                let (text, line) = (self.raw_get(c.obj, &c.key).map(|v| v.text()).unwrap_or_default(), c.new.map(|v| v.text()).unwrap_or_default());
+                let kept = text.strip_suffix(line.as_str()).map(|t| t.strip_suffix('\n').unwrap_or(t)).unwrap_or(&text).to_string();
+                self.raw_set(c.obj, &c.key, if kept.is_empty() { None } else { Some(Value::Str(kept)) });
+            }
+            ChangeKind::Order => {
                 let old: Vec<u32> = c.key.split(',').filter_map(|x| x.parse().ok()).collect();
                 let slots: Vec<usize> = self.file.objs.iter().enumerate().filter(|(_, o)| o.kind == Kind::Card).map(|(i, _)| i).collect();
                 let by_id: std::collections::HashMap<u32, Obj> = self.file.objs.iter().filter(|o| o.kind == Kind::Card).map(|o| (o.id, o.clone())).collect();
@@ -749,7 +859,6 @@ impl World {
                     for (slot, id) in slots.iter().zip(&old) { self.file.objs[*slot] = by_id[id].clone(); }
                 }
             }
-            _ => {}
         }
     }
 }

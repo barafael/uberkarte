@@ -1,37 +1,45 @@
 //! The player is the editor. Browse mode sends messages; edit mode moves parts and edits scripts.
 //! Every change is journaled and written to the stack file at once: there is no Save.
 use dioxus::prelude::*;
-use stack_core::{demo, files::Fs, Kind, Obj, Rt, Shape, SoundCmd, StackFile, Value, HOME};
+use stack_core::{demo, files::Fs, AssetKind, Kind, Obj, PlayerRequest, Rt, Shape, SoundCmd, StackFile, Stroke, Tool, Value, HOME};
 
 mod highlight;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Native fetches finished on other threads: (request id, text or error). The frame loop delivers them.
-#[cfg(not(target_arch = "wasm32"))]
-static FETCHED: std::sync::Mutex<Vec<(u64, Result<String, String>)>> = std::sync::Mutex::new(Vec::new());
-
-#[cfg(not(target_arch = "wasm32"))]
-thread_local! {
-    static FETCH_SEQ: RefCell<u64> = const { RefCell::new(0) };
-    static FETCH_TARGETS: RefCell<std::collections::HashMap<u64, (std::rc::Weak<Rt>, String, u32)>> = RefCell::new(Default::default());
+/// A `load url` request: fetch it, then tell the stack that asked (urlLoaded, or urlLoaded … "error"),
+/// if it is still open. The frame loop redraws.
+async fn load_url(target: std::rc::Weak<Rt>, url: String, to: u32) {
+    let result = fetch_text(url.clone()).await;
+    let Some(target) = target.upgrade() else { return };
+    match result {
+        Ok(text) => target.url_loaded(&url, &text, to),
+        Err(e) => { target.w.borrow_mut().log.push(format!("load url {url}: {e}")); target.url_failed(&url, &e, to); }
+    }
+    handle_requests();
+    save();
+    DIRTY.with(|d| *d.borrow_mut() = true);
 }
 
-/// Deliver finished native fetches to the stacks that asked (urlLoaded, or urlLoaded … "error").
+/// On the desktop, fetch natively, on the runtime's blocking pool: no browser cross-origin rule ("anything goes").
 #[cfg(not(target_arch = "wasm32"))]
-fn deliver_fetches() -> bool {
-    let done: Vec<(u64, Result<String, String>)> = std::mem::take(&mut *FETCHED.lock().unwrap());
-    let any = !done.is_empty();
-    for (id, r) in done {
-        let Some((target, url, to)) = FETCH_TARGETS.with(|t| t.borrow_mut().remove(&id)) else { continue };
-        let Some(target) = target.upgrade() else { continue };
-        match r {
-            Ok(text) => target.url_loaded(&url, &text, to),
-            Err(e) => { target.w.borrow_mut().log.push(format!("load url {url}: {e}")); target.url_failed(&url, &e, to); }
-        }
+async fn fetch_text(url: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        ureq::get(&url).timeout(std::time::Duration::from_secs(20)).call()
+            .map_err(|e| e.to_string())
+            .and_then(|resp| resp.into_string().map_err(|e| e.to_string()))
+    }).await.map_err(|e| e.to_string())?
+}
+
+/// In the browser, `fetch`, under the page's cross-origin rules.
+#[cfg(target_arch = "wasm32")]
+async fn fetch_text(url: String) -> Result<String, String> {
+    let js = format!("fetch({url:?}).then(r => r.ok ? r.text() : Promise.reject(r.status + ' ' + r.statusText)).then(t => dioxus.send([true, t])).catch(e => dioxus.send([false, e instanceof TypeError ? String(e) + ' (the site may not allow pages on other sites to read it: a browser rule; the desktop player has no such limit)' : String(e)]))");
+    match document::eval(&js).recv::<(bool, String)>().await {
+        Ok((true, text)) => Ok(text),
+        Ok((false, why)) => Err(why),
+        Err(e) => Err(format!("{e:?}")),
     }
-    if any { handle_requests(); save(); }
-    any
 }
 
 /// One open stack: a tab.
@@ -190,6 +198,8 @@ fn open_in(path: &str, new_tab: bool, startup: bool) {
     let rt = Rc::new(Rt::with_home(file, Some(home)));
     {
         let mut w = rt.w.borrow_mut();
+        // What the player reported to the stacks already open: the window and the time zone.
+        if let Some(prev) = rt_opt() { let p = prev.w.borrow(); (w.screen, w.window_loc, w.tz_offset_min) = (p.screen, p.window_loc, p.tz_offset_min); }
         w.fs = shared_fs();
         // Relative file paths start at the stack's own folder.
         w.fs_base = if cfg!(target_arch = "wasm32") { "/".into() } else {
@@ -249,10 +259,11 @@ fn close_tab(i: usize) {
     let n = TABS.with(|t| t.borrow().len());
     if n <= 1 { return; }
     let was_active = ACTIVE.with(|a| *a.borrow()) == i;
-    if was_active { save(); }
-    let rt_i = TABS.with(|t| t.borrow()[i].rt.clone());
+    // closeStack first, then save, so what its handler writes is kept (for any tab, showing or not).
+    let (rt_i, path_i) = TABS.with(|t| { let t = t.borrow(); (t[i].rt.clone(), t[i].path.clone()) });
     let c = rt_i.w.borrow().current_card();
     rt_i.send_with(c, "closeStack", vec![]);
+    save_stack(&rt_i, &path_i);
     TABS.with(|t| { t.borrow_mut().remove(i); });
     let active = ACTIVE.with(|a| *a.borrow());
     let next = if was_active { i.min(n - 2) } else if active > i { active - 1 } else { active };
@@ -263,14 +274,18 @@ fn close_tab(i: usize) {
 /// Things scripts asked the player to do: show another stack, fetch URLs, persist web files.
 fn handle_requests() {
     // Built-in menu items: Undo, Message (focus the message box), Quit HyperCard.
-    let (undo, message, quit) = { let r = rt(); let mut w = r.w.borrow_mut(); (std::mem::take(&mut w.undo_request), std::mem::take(&mut w.message_request), std::mem::take(&mut w.quit_request)) };
-    if undo { rt().undo(); }
-    if message { let _ = document::eval("setTimeout(() => document.querySelector('.foot input')?.focus(), 0)"); }
-    if quit {
-        save();
-        QUIT.with(|q| *q.borrow_mut() = true);
-        #[cfg(feature = "desktop")]
-        dioxus::desktop::window().close();
+    let requests = std::mem::take(&mut rt().w.borrow_mut().player_requests);
+    for r in requests {
+        match r {
+            PlayerRequest::Undo => rt().undo(),
+            PlayerRequest::FocusMessageBox => { let _ = document::eval("setTimeout(() => document.querySelector('.foot input')?.focus(), 0)"); }
+            PlayerRequest::Quit => {
+                save();
+                QUIT.with(|q| *q.borrow_mut() = true);
+                #[cfg(feature = "desktop")]
+                dioxus::desktop::window().close();
+            }
+        }
     }
     let go = rt().w.borrow_mut().go_stack.take();
     if let Some(g) = go {
@@ -292,65 +307,54 @@ fn handle_requests() {
         }
     }
     let urls = std::mem::take(&mut rt().w.borrow_mut().url_requests);
-    #[cfg(not(target_arch = "wasm32"))]
-    for (url, to) in urls {
-        // On the desktop, fetch natively: no browser cross-origin rule ("anything goes").
-        let target = Rc::downgrade(&rt());
-        let id = FETCH_SEQ.with(|s| { let mut s = s.borrow_mut(); *s += 1; *s });
-        FETCH_TARGETS.with(|t| t.borrow_mut().insert(id, (target, url.clone(), to)));
-        std::thread::spawn(move || {
-            let r = ureq::get(&url).timeout(std::time::Duration::from_secs(20)).call()
-                .map_err(|e| e.to_string())
-                .and_then(|resp| resp.into_string().map_err(|e| e.to_string()));
-            FETCHED.lock().unwrap().push((id, r));
-        });
-    }
-    #[cfg(target_arch = "wasm32")]
-    for (url, to) in urls {
-        let target = rt();
-        spawn(async move {
-            let js = format!("fetch({url:?}).then(r => r.ok ? r.text() : Promise.reject(r.status + ' ' + r.statusText)).then(t => dioxus.send([true, t])).catch(e => dioxus.send([false, e instanceof TypeError ? String(e) + ' (the site may not allow pages on other sites to read it: a browser rule; the desktop player has no such limit)' : String(e)]))");
-            let mut ch = document::eval(&js);
-            if let Ok((ok, text)) = ch.recv::<(bool, String)>().await {
-                if ok { target.url_loaded(&url, &text, to); } else { target.w.borrow_mut().log.push(format!("load url {url}: {text}")); target.url_failed(&url, &text, to); }
-                handle_requests();
-                save();
-                DIRTY.with(|d| *d.borrow_mut() = true);
-            }
-        });
-    }
-    // On the web, file changes go to the browser's private file system.
+    for (url, to) in urls { spawn(load_url(Rc::downgrade(&rt()), url, to)); }
+    // On the web, file changes go to the browser's private file system, one batch after another
+    // (each waits for the one before, so a later write or delete never lands first).
     #[cfg(target_arch = "wasm32")]
     {
         let changes = shared_fs().borrow_mut().take_changes();
         if !changes.is_empty() {
-            let json = format!("[{}]", changes.iter().map(|(op, p, t)| format!("[{op:?},{p:?},{t:?}]")).collect::<Vec<_>>().join(","));
-            let _ = document::eval(&format!(r#"(async () => {{
+            use stack_core::files::FsChange;
+            let row = |c: &FsChange| match c {
+                FsChange::Write { path, text } => format!("[\"write\",{path:?},{text:?}]"),
+                FsChange::Delete { path } => format!("[\"delete\",{path:?},\"\"]"),
+                FsChange::Folder { path } => format!("[\"folder\",{path:?},\"\"]"),
+            };
+            let json = format!("[{}]", changes.iter().map(row).collect::<Vec<_>>().join(","));
+            let _ = document::eval(&format!(r#"window.__hcDisk = (window.__hcDisk || Promise.resolve()).then(async () => {{
                 const root = await navigator.storage.getDirectory();
                 for (const [op, path, text] of {json}) {{
-                    const parts = path.split('/').filter(Boolean); const last = parts.pop(); let dir = root;
-                    for (const p of parts) dir = await dir.getDirectoryHandle(p, {{ create: true }});
-                    if (op === 'write') {{ const f = await dir.getFileHandle(last, {{ create: true }}); const w = await f.createWritable(); await w.write(text); await w.close(); }}
-                    else if (op === 'delete') {{ await dir.removeEntry(last); }}
-                    else if (op === 'folder') {{ await dir.getDirectoryHandle(last, {{ create: true }}); }}
+                    try {{
+                        const parts = path.split('/').filter(Boolean); const last = parts.pop(); let dir = root;
+                        for (const p of parts) dir = await dir.getDirectoryHandle(p, {{ create: true }});
+                        if (op === 'write') {{ const f = await dir.getFileHandle(last, {{ create: true }}); const w = await f.createWritable(); await w.write(text); await w.close(); }}
+                        else if (op === 'delete') {{ await dir.removeEntry(last); }}
+                        else if (op === 'folder') {{ await dir.getDirectoryHandle(last, {{ create: true }}); }}
+                    }} catch (e) {{ console.warn('browser storage:', op, path, e); }}
                 }}
-            }})()"#));
+            }});"#));
         }
     }
 }
 
 /// Immediate persistence: called after every action.
 fn save() {
+    let path = PATH.with(|p| p.borrow().clone());
+    if let Some(rt) = rt_opt() { save_stack(&rt, &path); }
+}
+
+/// Write a stack (any tab's) and Home to disk. The web player keeps stacks in memory.
+fn save_stack(rt: &Rt, path: &str) {
     #[cfg(not(target_arch = "wasm32"))]
-    PATH.with(|p| {
-        let path = p.borrow();
+    {
         if path.is_empty() { return; }
-        let Some(rt) = rt_opt() else { return };
-        if let Some(dir) = std::path::Path::new(path.as_str()).parent() { let _ = std::fs::create_dir_all(dir); }
+        if let Some(dir) = std::path::Path::new(path).parent() { let _ = std::fs::create_dir_all(dir); }
         let write = |path: &str, bytes: Vec<u8>| { let tmp = format!("{path}.tmp"); if std::fs::write(&tmp, bytes).is_ok() { let _ = std::fs::rename(&tmp, path); } };
-        write(path.as_str(), rt.bytes());
+        write(path, rt.bytes());
         if let Some(home) = rt.home_text().and_then(|t| StackFile::from_text(&t).ok()) { write(&home_path(), home.to_zip()); }
-    });
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (rt, path);
 }
 
 /// Microseconds spent in `f`. web-time uses performance.now() in the browser (often coarsened to 5–100 µs).
@@ -405,7 +409,8 @@ button.t { font:inherit; padding:4px 10px; border:1px solid var(--line); backgro
 button.t.on { background:var(--ink); color:#fff; border-color:var(--ink); }
 .main { display:flex; flex:1; min-height:0; min-width:0; overflow:hidden; }
 .stage { flex:1 1 0; min-width:160px; overflow:auto; padding:24px; }
-.card { position:relative; background:var(--card); border:1px solid var(--ink); box-shadow:3px 3px 0 var(--ink); user-select:none; }
+/* The card is its own stacking context: its layers (background parts, paint, card parts) stay under the menus and dialogs. */
+.card { position:relative; isolation:isolate; background:var(--card); border:1px solid var(--ink); box-shadow:3px 3px 0 var(--ink); user-select:none; }
 .part { position:absolute; }
 .part > button, .part > textarea { width:100%; height:100%; font:inherit; margin:0; }
 .part > button { border:1.5px solid var(--ink); border-radius:7px; background:#fff; cursor:pointer; }
@@ -454,7 +459,7 @@ input.t { font:inherit; padding:4px 8px; border:1px solid var(--line); border-ra
 .foot { border-top:1px solid var(--line); background:var(--panel); padding:8px 12px; display:flex; flex-direction:column; gap:4px; }
 .foot input { font:13px ui-monospace, Menlo, monospace; padding:5px 8px; border:1px solid var(--ink); border-radius:3px; width:100%; }
 .log { font:12px ui-monospace, Menlo, monospace; color:var(--muted); white-space:pre-wrap; max-height:54px; overflow:auto; }
-.veil { position:fixed; inset:0; background:rgba(20,30,40,.35); display:flex; align-items:center; justify-content:center; }
+.veil { position:fixed; inset:0; z-index:100; background:rgba(20,30,40,.35); display:flex; align-items:center; justify-content:center; }
 .dlg { background:#fff; border:2px solid var(--ink); box-shadow:4px 4px 0 var(--ink); padding:20px 24px; min-width:260px; display:flex; flex-direction:column; gap:14px; align-items:flex-end; }
 .dlg p { margin:0; align-self:flex-start; }
 .part > button.hilite { background:var(--ink); color:#fff; }
@@ -540,7 +545,6 @@ label.t input { display:none; }
 #[component]
 fn App() -> Element {
     let mut tick = use_signal(|| 0u32);
-    let mut edit = use_signal(|| false);
     let mut sel = use_signal(|| None::<u32>);
     // All selected parts (shift-click adds or removes); `sel` is the first, which the inspector shows.
     let mut multi = use_signal(Vec::<u32>::new);
@@ -548,171 +552,43 @@ fn App() -> Element {
     let mut drag = use_signal(|| None::<(f64, f64, f64, f64)>);
     let mut new_card_form = use_signal(|| None::<(String, String)>);
     let mut msg = use_signal(String::new);
-    // The open menu in the menu bar, and the stroke being painted (card coordinates).
+    // The open menu in the menu bar.
     let mut open_menu = use_signal(|| None::<usize>);
-    let mut stroke = use_signal(Vec::<(f64, f64)>::new);
     let mut ask_text = use_signal(String::new);
     let mut file_dir = use_signal(|| None::<String>);
     let mut compile_us = use_signal(|| 0u128);
-    let mut stats = use_signal(|| (0.0f64, 0u128));
+    let stats = use_signal(|| (0.0f64, 0u128));
     let mut insp_w = use_signal(|| 420.0f64);
     let mut resize = use_signal(|| None::<(f64, f64)>);
     let _ = tick();
 
     // Frame loop: in browse mode, a card with a canvas part gets `frame` once per display frame.
-    use_future(move || async move {
-        let mut raf = document::eval(RAF);
-        let mut times: std::collections::VecDeque<f64> = Default::default();
-        let mut cost = 0u128;
-        let mut last_idle = 0.0f64;
-        while let Ok(t) = raf.recv::<f64>().await {
-            // `edit the script of …` opens the editor on that object.
-            if let Some(id) = rt().w.borrow_mut().edit_request.take() { rt().w.borrow_mut().tool = "button".into(); edit.set(true); sel.set(Some(id)); multi.set(vec![]); tick += 1; }
-            // `choose button tool` / `choose browse tool` from a script switch the player's mode.
-            {
-                let tool = rt().w.borrow().tool.clone();
-                let wants_edit = tool == "button" || tool == "field";
-                if wants_edit != edit() { edit.set(wants_edit); tick += 1; }
-            }
-            if DIRTY.with(|d| std::mem::take(&mut *d.borrow_mut())) { flush_sound(); tick += 1; }
-            #[cfg(not(target_arch = "wasm32"))]
-            if deliver_fetches() { flush_sound(); tick += 1; }
-            // A paused script (answer, ask, wait): end its wait when the time comes, check `wait until` again.
-            let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0);
-            if rt().tick(now) { handle_requests(); save(); flush_sound(); tick += 1; }
-            if edit() { times.clear(); continue; }
-            // `select …` from a script: show it in the field, after the redraw that the command caused.
-            if let Some((f, a, b)) = rt().w.borrow_mut().select_request.take() {
-                let _ = document::eval(&format!("setTimeout(() => {{ const t = document.querySelector('textarea[data-id=\"{f}\"]'); if (t) {{ t.focus({{ preventScroll: true }}); t.setSelectionRange({a}, {b}); }} }}, 80)"));
-            }
-            // About ten times a second: idle, for stacks that handle it.
-            if now - last_idle >= 100.0 { last_idle = now; if rt().idle() { handle_requests(); flush_sound(); tick += 1; } }
-            // Browse mode: due `send … in` messages, then mouseStillDown / mouseWithin, then frame.
-            // Nothing of that while a script is paused: the stack is modal until it finishes.
-            if rt().is_paused() { times.clear(); continue; }
-            // Save only when something was written: these messages can arrive every frame.
-            let before = { let r = rt(); let w = r.w.borrow(); (w.file.journal.len(), w.file.journal.last().map(|c| format!("{:?}", c.new))) };
-            let mut changed = rt().run_timers(now) > 0;
-            let (pressed, hover, down) = { let r = rt(); let w = r.w.borrow(); (w.pressed, w.hover, w.mouse_down) };
-            if let (Some(p), true) = (pressed, down) { rt().send_with(p, "mouseStillDown", vec![]); changed = true; }
-            if let Some(h) = hover { rt().send_with(h, "mouseWithin", vec![]); changed = true; }
-            if changed {
-                let after = { let r = rt(); let w = r.w.borrow(); (w.file.journal.len(), w.file.journal.last().map(|c| format!("{:?}", c.new))) };
-                handle_requests();
-                if after != before { save(); }
-                flush_sound();
-                tick += 1;
-            }
-            let mut ran = false;
-            cost = (cost * 7 + timed(|| ran = rt().frame())) / 8;
-            flush_sound();
-            if !ran { times.clear(); continue; }
-            times.push_back(t);
-            if times.len() > 60 { times.pop_front(); }
-            if times.len() > 1 {
-                let fps = (times.len() - 1) as f64 * 1000.0 / (times.back().unwrap() - times.front().unwrap());
-                stats.set((fps, cost));
-            }
-            tick += 1;
-        }
-    });
-
-    // Text selection in fields (for the selection, selectedText, type) and window size (sizeWindow).
-    use_future(move || async move {
-        let mut ch = document::eval(r#"
-            document.addEventListener('selectionchange', () => { const a = document.activeElement; if (a && a.dataset && a.dataset.id) dioxus.send(['sel', +a.dataset.id, a.selectionStart, a.selectionEnd]); });
-            let t; window.addEventListener('resize', () => { clearTimeout(t); t = setTimeout(() => dioxus.send(['size', innerWidth, innerHeight, 0]), 150); });
-            dioxus.send(['size', innerWidth, innerHeight, 1]);
-            document.addEventListener('visibilitychange', () => dioxus.send(['vis', document.hidden ? 1 : 0, 0, 0]));
-            let sx = screenX, sy = screenY;
-            dioxus.send(['move', sx, sy, 1]);
-            setInterval(() => { if (screenX !== sx || screenY !== sy) { sx = screenX; sy = screenY; dioxus.send(['move', sx, sy, 0]); } }, 500);
-            await new Promise(() => {});"#);
-        while let Ok((kind, a, b, c)) = ch.recv::<(String, f64, f64, f64)>().await {
-            let r = rt();
-            let card = r.w.borrow().current_card();
-            match kind.as_str() {
-                "sel" => r.w.borrow_mut().selection = Some((a as u32, b as usize, c as usize)),
-                // The window's size and place, for the screenRect; sizeWindow and moveWindow when they change.
-                "size" => {
-                    TABS.with(|t| for tab in t.borrow().iter() { tab.rt.w.borrow_mut().screen = (a, b); });
-                    if c == 0.0 && !edit() { r.send_with(card, "sizeWindow", vec![]); save(); tick += 1; }
-                }
-                "move" => {
-                    TABS.with(|t| for tab in t.borrow().iter() { tab.rt.w.borrow_mut().window_loc = (a, b); });
-                    if c == 0.0 && !edit() { r.send_with(card, "moveWindow", vec![]); save(); tick += 1; }
-                }
-                // The player hidden or shown again (another window or tab in front): suspend / resume.
-                "vis" => { r.send_with(card, if a == 1.0 { "suspend" } else { "resume" }, vec![]); handle_requests(); save(); tick += 1; }
-                _ => {}
-            }
-        }
-    });
-
+    use_future(move || frame_loop(tick, sel, multi, stats));
+    // Text selection in fields (for the selection, selectedText, type), the window (sizeWindow, moveWindow), suspend/resume.
+    use_future(move || window_events(tick));
     // On the web, the file system is restored from the browser's private storage at start.
     #[cfg(target_arch = "wasm32")]
-    use_future(move || async move {
-        let mut ch = document::eval(r#"
-            const out = [];
-            async function walk(dir, prefix) {
-                for await (const [name, h] of dir.entries()) {
-                    if (h.kind === 'file') out.push([prefix + '/' + name, await (await h.getFile()).text(), true]);
-                    else { out.push([prefix + '/' + name, '', false]); await walk(h, prefix + '/' + name); }
-                }
-            }
-            try { await walk(await navigator.storage.getDirectory(), ''); } catch (e) {}
-            dioxus.send(out);"#);
-        if let Ok(entries) = ch.recv::<Vec<(String, String, bool)>>().await {
-            let fs = shared_fs();
-            for (p, t, is_file) in entries { fs.borrow_mut().preload(&p, if is_file { Some(&t) } else { None }); }
-        }
-        // Now the stack can open: its openStack handler sees the restored files.
-        if DEFERRED_OPEN.with(|d| std::mem::take(&mut *d.borrow_mut())) {
-            rt().open_stack(true);
-            handle_requests();
-            save();
-            flush_sound();
-            tick += 1;
-        }
-    });
-
+    use_future(move || restore_browser_disk(tick));
     // The local time zone, for the date and the time.
-    use_future(move || async move {
-        let mut ch = document::eval("dioxus.send(-new Date().getTimezoneOffset())");
-        if let Ok(min) = ch.recv::<f64>().await { rt().w.borrow_mut().tz_offset_min = min as i64; }
-    });
-
-    // Test hook (desktop): HC_AUTODRIVE names a JavaScript file of UI actions to run inside this window;
-    // what it sends back is appended to HC_AUTODRIVE_OUT. Without the variable this does nothing.
+    use_future(local_time_zone);
+    // Test hook (desktop): HC_AUTODRIVE names a JavaScript file of UI actions to run inside this window.
     #[cfg(not(target_arch = "wasm32"))]
-    use_future(move || async move {
-        let Ok(script) = std::env::var("HC_AUTODRIVE") else { return };
-        let out = std::env::var("HC_AUTODRIVE_OUT").unwrap_or_else(|_| "autodrive.log".into());
-        let js = std::fs::read_to_string(&script).unwrap_or_default();
-        let mut ch = document::eval(&js);
-        while let Ok(line) = ch.recv::<String>().await {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&out) { let _ = writeln!(f, "{line}"); }
-        }
-    });
-
+    use_future(autodrive);
     // Keyboard messages go to the player, so it takes focus when it starts.
     use_effect(|| { let _ = document::eval("setTimeout(() => document.querySelector('.app')?.focus({ preventScroll: true }), 0)"); });
-
     // Browser audio: reports when a sound ends, so `the sound` clears and scripts get `soundDone`.
-    use_future(move || async move {
-        let mut ch = document::eval(SOUND_JS);
-        while let Ok(m) = ch.recv::<String>().await {
-            if m != "ended" { rt().w.borrow_mut().log.push(format!("sound: {m}")); }
-            rt().sound_finished();
-            flush_sound();
-            save();
-            tick += 1;
-        }
+    use_future(move || sound_events(tick));
+    // An ask dialog starts with its default answer; the box is cleared when no dialog is open. (After the render
+    // that showed the dialog: signals are not written while rendering.)
+    use_effect(move || {
+        let _ = tick();
+        let (open, default) = { let r = rt(); let w = r.w.borrow(); (w.dialog.is_some(), w.dialog_ask.clone()) };
+        if let Some(d) = default { if ask_text.peek().is_empty() && !d.is_empty() { ask_text.set(d); } }
+        if !open && !ask_text.peek().is_empty() { ask_text.set(String::new()); }
     });
 
     // After any action: write the file, start or stop sounds, redraw.
-    let mut done = move || { handle_requests(); save(); flush_sound(); tick += 1; };
+    let done = move || after_action(tick);
 
     let r = rt();
     let (name, width, height, card, bg, stack, ncards, cardno, dialog, error, log, fx, fx_seq, assets) = {
@@ -723,21 +599,17 @@ fn App() -> Element {
          w.effect.clone().unwrap_or_default(), w.effect_seq, w.file.assets.clone())
     };
     let (dialog_buttons, dialog_ask, dialog_file) = { let w = r.w.borrow(); (w.dialog_buttons.clone(), w.dialog_ask.clone(), w.dialog_file.clone()) };
-    // An ask dialog starts with its default answer; the box is cleared when no dialog is open.
-    if let Some(d) = dialog_ask.clone() { if ask_text.peek().is_empty() && !d.is_empty() { ask_text.set(d); } }
-    if dialog.is_none() && !ask_text.peek().is_empty() { ask_text.set(String::new()); }
-    let pictures: Vec<String> = assets.iter().filter(|a| a.kind == "picture").map(|a| a.name.clone()).collect();
+    let pictures: Vec<String> = assets.iter().filter(|a| a.kind == AssetKind::Picture).map(|a| a.name.clone()).collect();
     let parts = part_views();
     let draws = r.w.borrow().draw.clone();
-    let animating = !edit() && parts.iter().any(|p| p.kind == Kind::Canvas);
+    // The tool is the mode: the button and field tools are edit mode (from user level 4).
+    let editing = editing_now();
+    let animating = !editing && parts.iter().any(|p| p.kind == Kind::Canvas);
     let (fps, frame_us) = stats();
     // The user level (HyperCard's five): below 4 there is no editing, at 4 no script editing, at 1 no typing.
     let user_level = r.w.borrow().user_level;
-    let (tool, menus, message_visible, paint) = { let w = r.w.borrow(); (w.tool.clone(), w.menus.clone(), w.message_visible, w.get(card, "paint").text()) };
-    let painting = !edit() && user_level >= 3 && !matches!(tool.as_str(), "browse" | "button" | "field");
-    let paint_svg_markup = paint_svg(&paint, if painting && !stroke().is_empty() { Some((tool.as_str(), r.w.borrow().line_size, r.w.borrow().filled, stroke())) } else { None }, width, height);
-    if edit() && user_level < 4 { edit.set(false); r.w.borrow_mut().tool = "browse".into(); }
-    let editing = edit() && user_level >= 4;
+    let (tool, line_size, filled, menus, message_visible, paint) = { let w = r.w.borrow(); (w.tool, w.line_size, w.filled, w.menus.clone(), w.message_visible, w.get(card, "paint").text()) };
+    let painting = !editing && tool.strokes() && user_level >= tool.user_level();
     let target = sel().filter(|id| r.w.borrow().obj(*id).is_some()).unwrap_or(card);
     let (t_kind, t_name, t_script, t_text, t_rect, t_err) = {
         let w = r.w.borrow();
@@ -801,7 +673,7 @@ fn App() -> Element {
         }
         save(); flush_sound(); tick += 1;
     };
-    let mut arrange = move |how: &'static str| {
+    let arrange = move |how: &'static str| {
         let r = rt();
         { let mut w = r.w.borrow_mut(); w.begin(); w.arrange(&multi(), how); }
         done();
@@ -820,7 +692,7 @@ fn App() -> Element {
     let n_sel = multi().len();
 
     rsx! {
-        style { dangerous_inner_html: CSS }
+        document::Style { {CSS} }
         div { class: if resize().is_some() { "app resizing" } else { "app" }, tabindex: "0",
             onmousemove: move |e| { if let Some((sx, sw)) = resize() { insp_w.set((sw + sx - e.client_coordinates().x).clamp(260.0, 1100.0)); } },
             onmouseup: move |_| { if resize().is_some() { resize.set(None); } { let r = rt(); let mut w = r.w.borrow_mut(); w.mouse_down = false; w.pressed = None; } },
@@ -863,7 +735,7 @@ fn App() -> Element {
             onkeyup: move |e| { rt().w.borrow_mut().keys.remove(&e.key().to_string()); },
             if QUIT.with(|q| *q.borrow()) {
                 div { class: "veil", style: "z-index:1000",
-                    div { class: "dlg", p { "HyperCard has quit. Your stacks are saved." }
+                    div { class: "dlg", role: "alertdialog", aria_modal: "true", p { "HyperCard has quit. Your stacks are saved." }
                         div { class: "row", button { class: "t on", onclick: move |_| { let _ = document::eval("location.reload()"); }, "Start again" } }
                     }
                 }
@@ -878,20 +750,22 @@ fn App() -> Element {
                     }
                 }
             }
-            div { class: "menubar", onmouseleave: move |_| open_menu.set(None),
-                for (mi, m) in menus.into_iter().enumerate() {
+            div { class: "menubar", role: "menubar", onmouseleave: move |_| open_menu.set(None),
+                for (mi, m) in menus.iter().cloned().enumerate() {
                     div { key: "{mi}", class: "menu",
-                        button { class: if open_menu() == Some(mi) { "mname on" } else { "mname" },
+                        button { class: if open_menu() == Some(mi) { "mname on" } else { "mname" }, role: "menuitem",
+                            aria_haspopup: "menu", aria_expanded: if open_menu() == Some(mi) { "true" } else { "false" },
                             onclick: move |_| open_menu.set(if open_menu() == Some(mi) { None } else { Some(mi) }),
                             onmouseenter: move |_| { if open_menu().is_some() { open_menu.set(Some(mi)); } },
                             "{m.name}" }
                         if open_menu() == Some(mi) {
-                            div { class: "drop",
-                                for (ii, it) in m.items.clone().into_iter().enumerate() {
-                                    if it.text == "-" { div { key: "{ii}", class: "sep" } }
+                            div { class: "drop", role: "menu", aria_label: "{m.name}",
+                                for (ii, it) in m.items.into_iter().enumerate() {
+                                    if it.text == "-" { div { key: "{ii}", class: "sep", role: "separator" } }
                                     else {
                                         { let (text, mname) = (it.text.clone(), m.name.clone());
                                           rsx! { button { key: "{ii}", class: if it.enabled { "item" } else { "item off" }, disabled: !it.enabled,
+                                              role: if it.checked { "menuitemcheckbox" } else { "menuitem" }, aria_checked: if it.checked { "true" } else { "false" },
                                               onclick: move |_| { open_menu.set(None); rt().do_menu(&text, &mname); done(); },
                                               if it.checked { "✓ " } "{it.text}" } } }
                                     }
@@ -905,8 +779,9 @@ fn App() -> Element {
                     label { class: "toolpick", "Tool "
                         select { class: "t", value: "{tool}",
                             onchange: move |e| { rt().exec(&format!("choose {} tool;", e.value())); done(); },
-                            for t in stack_core::TOOLS.iter().filter(|t| user_level >= 4 || !matches!(**t, "button" | "field")).filter(|t| !matches!(**t, "select" | "lasso" | "bucket" | "text")) {
-                                option { value: "{t}", selected: *t == tool, "{t}" }
+                            // The tools this user level may choose that work here, and always the current one.
+                            for t in Tool::all().iter().copied().filter(|t| *t == tool || (t.user_level() <= user_level && (!t.is_paint() || t.strokes()))) {
+                                option { value: "{t}", selected: t == tool, "{t}" }
                             }
                         }
                     }
@@ -914,49 +789,19 @@ fn App() -> Element {
             }
             div { class: "bar",
                 b { "{name}" }
-                button { class: if !editing { "t on" } else { "t" }, onclick: move |_| { edit.set(false); drag.set(None); rt().w.borrow_mut().tool = "browse".into(); }, "Browse" }
-                if user_level >= 4 { button { class: if editing { "t on" } else { "t" }, onclick: move |_| { edit.set(true); rt().w.borrow_mut().tool = "button".into(); }, "Edit" } }
+                button { class: if !editing { "t on" } else { "t" }, onclick: move |_| { drag.set(None); rt().w.borrow_mut().tool = Tool::Browse; tick += 1; }, "Browse" }
+                if user_level >= 4 { button { class: if editing { "t on" } else { "t" }, onclick: move |_| { rt().w.borrow_mut().tool = Tool::Button; tick += 1; }, "Edit" } }
                 if editing {
                     button { class: "t", onclick: move |_| { let mut f = new_part; f(Kind::Button) }, "+ Button" }
                     button { class: "t", onclick: move |_| { let mut f = new_part; f(Kind::Field) }, "+ Field" }
                     button { class: "t", onclick: move |_| { let mut f = new_part; f(Kind::Canvas) }, "+ Canvas" }
                     label { class: "t", title: "Add pictures to the stack and place them on this card",
                         "+ Picture"
-                        input { r#type: "file", accept: "image/*", multiple: true, onchange: move |e| async move {
-                            for f in e.files() {
-                                let Ok(bytes) = f.read_bytes().await else { continue };
-                                let (name, mime) = asset_name_and_type(&f.name());
-                                let r = rt();
-                                let id = {
-                                    let mut w = r.w.borrow_mut();
-                                    w.begin();
-                                    w.add_asset(&name, &mime, bytes.to_vec());
-                                    let card = w.current_card();
-                                    let id = w.create(Kind::Picture, &name, Some(card), None);
-                                    let (cw, ch) = (w.file.width, w.file.height);
-                                    for (k, v) in [("left", 0), ("top", 0), ("width", cw), ("height", ch - 60)] { w.set(id, k, Value::Int(v), false); }
-                                    w.set(id, "picture", Value::Str(name.clone()), false);
-                                    id
-                                };
-                                sel.set(Some(id));
-                                multi.set(vec![id]);
-                            }
-                            done();
-                        } }
+                        input { r#type: "file", accept: "image/*", multiple: true, onchange: move |e| { spawn(add_pictures(e.files(), sel, multi, tick)); } }
                     }
                     label { class: "t", title: "Add sounds to the stack; play them with: play \"name\";",
                         "+ Sound"
-                        input { r#type: "file", accept: "audio/*", multiple: true, onchange: move |e| async move {
-                            for f in e.files() {
-                                let Ok(bytes) = f.read_bytes().await else { continue };
-                                let (name, mime) = asset_name_and_type(&f.name());
-                                let r = rt();
-                                { let mut w = r.w.borrow_mut(); w.begin(); w.add_asset(&name, &mime, bytes.to_vec()); }
-                                r.w.borrow_mut().log.push(format!("added sound \"{name}\": play it with  play \"{name}\";"));
-                                SENT.with(|s| s.borrow_mut().remove(&name));
-                            }
-                            done();
-                        } }
+                        input { r#type: "file", accept: "audio/*", multiple: true, onchange: move |e| { spawn(add_sounds(e.files(), tick)); } }
                     }
                     button { class: "t", title: "New card after this one, with a name and a background", onclick: move |_| {
                         let bg = rt().w.borrow().background_of(rt().w.borrow().current_card()).map(|b| b.to_string()).unwrap_or_default();
@@ -1060,17 +905,7 @@ fn App() -> Element {
                                 done();
                             }
                         },
-                        div { class: "paintlayer", dangerous_inner_html: "{paint_svg_markup}" }
-                        // With a paint tool, the card is for painting: drags become strokes.
-                        if painting {
-                            div { class: "paintcatch",
-                                onmousedown: move |e| { e.stop_propagation(); let p = e.element_coordinates(); stroke.set(vec![(p.x, p.y)]); },
-                                onmousemove: move |e| { if !stroke().is_empty() { let p = e.element_coordinates(); stroke.write().push((p.x, p.y)); } },
-                                onmouseup: move |e| { e.stop_propagation(); let pts = stroke(); stroke.set(vec![]); if !pts.is_empty() { rt().paint(&pts); done(); } },
-                                onmouseleave: move |_| { let pts = stroke(); stroke.set(vec![]); if !pts.is_empty() { rt().paint(&pts); done(); } },
-                                onclick: move |e| e.stop_propagation(),
-                            }
-                        }
+                        PaintLayer { paint, tool, line_size, filled, width, height, painting, on_stroke: move |pts: Vec<(f64, f64)>| { rt().paint(&pts); done(); } }
                         for p in parts.into_iter().filter(|p| p.visible || editing) {
                             div {
                                 key: "{p.id}",
@@ -1147,14 +982,9 @@ fn App() -> Element {
                                         "data-id": "{p.id}",
                                         wrap: if p.dont_wrap { "off" } else { "soft" },
                                         // A locked field acts like a button; an unlocked one is for typing.
-                                        onclick: move |e| async move {
+                                        onclick: move |e| {
                                             e.stop_propagation();
-                                            if editing || !p.locked { return; }
-                                            // Where in the text the click landed: a read-only textarea still places the caret.
-                                            let mut ch = document::eval(&format!("const t = document.querySelector('textarea[data-id=\"{}\"]'); dioxus.send(t ? t.selectionStart : -1)", p.id));
-                                            let at = ch.recv::<f64>().await.ok().filter(|a| *a >= 0.0).map(|a| a as usize);
-                                            rt().click_field(p.id, at);
-                                            done();
+                                            if !editing && p.locked { spawn(click_locked_field(p.id, tick)); }
                                         },
                                         onfocus: move |_| {
                                             rt().w.borrow_mut().focused = Some(p.id);
@@ -1252,7 +1082,7 @@ fn App() -> Element {
                                     for a in assets.clone() {
                                         div { key: "{a.name}",
                                             span { title: "{a.file}", "{a.kind}: {a.name}" }
-                                            if a.kind == "sound" {
+                                            if a.kind == AssetKind::Sound {
                                                 button { class: "t", onclick: move |_| { rt().exec(&format!("play {:?};", a.name)); done(); }, "▶" }
                                             }
                                         }
@@ -1294,7 +1124,7 @@ fn App() -> Element {
             }
             if let Some(text) = dialog {
                 div { class: "veil",
-                    div { class: "dlg", p { "{text}" }
+                    div { class: "dlg", role: "dialog", aria_modal: "true", aria_label: "{text}", p { "{text}" }
                         if let Some((saving, start)) = dialog_file.clone() {
                             {
                                 // answer file / ask file: browse folders, pick a file or name one.
@@ -1345,51 +1175,279 @@ fn App() -> Element {
     }
 }
 
-/// The card's paint as SVG: one shape per stroke ("<tool> <lineSize> <filled> h,v h,v …"), plus the stroke
-/// being painted. Black ink on the card, as in HyperCard; the eraser paints the card colour.
-fn paint_svg(paint: &str, live: Option<(&str, i64, bool, Vec<(f64, f64)>)>, w: i64, h: i64) -> String {
-    let mut out = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">"#);
-    let mut shape = |tool: &str, size: i64, filled: bool, pts: &[(f64, f64)]| {
-        if pts.is_empty() { return; }
-        let ink = "#111";
-        let (a, b) = (pts[0], *pts.last().unwrap());
-        let poly = |pts: &[(f64, f64)]| pts.iter().map(|(x, y)| format!("{x:.0},{y:.0}")).collect::<Vec<_>>().join(" ");
-        let fill = if filled { ink } else { "none" };
-        let (x, y, bw, bh) = (a.0.min(b.0), a.1.min(b.1), (a.0 - b.0).abs(), (a.1 - b.1).abs());
-        let line = |width: f64, color: &str, extra: &str| if pts.len() == 1 {
-            format!(r#"<circle cx="{:.0}" cy="{:.0}" r="{}" fill="{color}"/>"#, a.0, a.1, (width / 2.0).max(0.5))
-        } else {
-            format!(r#"<polyline points="{}" fill="none" stroke="{color}" stroke-width="{width}" stroke-linecap="round" stroke-linejoin="round" {extra}/>"#, poly(pts))
-        };
-        out.push_str(&match tool {
-            "pencil" => line(1.0, ink, ""),
-            "brush" => line(6.0, ink, ""),
-            "eraser" => line(14.0, "#fff", ""),
-            "spray" => line(8.0, ink, r#"stroke-dasharray="0.5 4" opacity="0.7""#),
-            "curve" | "polygon" => line(size as f64, ink, ""),
-            "line" => format!(r#"<line x1="{:.0}" y1="{:.0}" x2="{:.0}" y2="{:.0}" stroke="{ink}" stroke-width="{size}" stroke-linecap="round"/>"#, a.0, a.1, b.0, b.1),
-            "rectangle" => format!(r#"<rect x="{x:.0}" y="{y:.0}" width="{bw:.0}" height="{bh:.0}" fill="{fill}" stroke="{ink}" stroke-width="{size}"/>"#),
-            "round_rect" | "round rect" => format!(r#"<rect x="{x:.0}" y="{y:.0}" width="{bw:.0}" height="{bh:.0}" rx="10" fill="{fill}" stroke="{ink}" stroke-width="{size}"/>"#),
-            "oval" => format!(r#"<ellipse cx="{:.0}" cy="{:.0}" rx="{:.0}" ry="{:.0}" fill="{fill}" stroke="{ink}" stroke-width="{size}"/>"#, x + bw / 2.0, y + bh / 2.0, bw / 2.0, bh / 2.0),
-            "regular_polygon" | "regular polygon" => {
-                // Drawn from its centre, as in HyperCard: six sides through the end point.
-                let r = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
-                let t0 = (b.1 - a.1).atan2(b.0 - a.0);
-                let v: Vec<(f64, f64)> = (0..6).map(|k| { let t = t0 + k as f64 * std::f64::consts::PI / 3.0; (a.0 + r * t.cos(), a.1 + r * t.sin()) }).collect();
-                format!(r#"<polygon points="{}" fill="{fill}" stroke="{ink}" stroke-width="{size}"/>"#, poly(&v))
-            }
-            _ => String::new(),
-        });
-    };
-    for l in paint.lines() {
-        let mut it = l.split_whitespace();
-        let (Some(tool), Some(size), Some(filled)) = (it.next(), it.next(), it.next()) else { continue };
-        let pts: Vec<(f64, f64)> = it.filter_map(|p| p.split_once(',')).filter_map(|(x, y)| Some((x.parse().ok()?, y.parse().ok()?))).collect();
-        shape(tool, size.parse().unwrap_or(1), filled == "1", &pts);
+/// After any action: write the file, start or stop sounds, redraw.
+fn after_action(mut tick: Signal<u32>) { handle_requests(); save(); flush_sound(); tick += 1; }
+
+/// Edit mode: the button or field tool, from user level 4 (the frame loop puts lower levels back on browse).
+fn editing_now() -> bool { let r = rt(); let w = r.w.borrow(); w.tool.edits_parts() && w.user_level >= 4 }
+
+fn now_ms() -> f64 { web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0) }
+
+/// The frame loop, driven by requestAnimationFrame. In browse mode: due `send … in` messages, mouseStillDown and
+/// mouseWithin, idle about ten times a second, and `frame` for a card with a canvas part.
+async fn frame_loop(mut tick: Signal<u32>, mut sel: Signal<Option<u32>>, mut multi: Signal<Vec<u32>>, mut stats: Signal<(f64, u128)>) {
+    let mut raf = document::eval(RAF);
+    let mut times: std::collections::VecDeque<f64> = Default::default();
+    let mut cost = 0u128;
+    let mut last_idle = 0.0f64;
+    let mut was_editing = false;
+    while let Ok(t) = raf.recv::<f64>().await {
+        // `edit the script of …` opens the editor on that object.
+        let edit_request = rt().w.borrow_mut().edit_request.take();
+        if let Some(id) = edit_request { rt().w.borrow_mut().tool = Tool::Button; sel.set(Some(id)); multi.set(vec![]); tick += 1; }
+        // The tool decides the player's mode: `choose button tool` / `choose browse tool` from a script switch it.
+        // Below user level 4 there is no editing, so the button and field tools go back to browse.
+        {
+            let r = rt();
+            let mut w = r.w.borrow_mut();
+            if w.tool.edits_parts() && w.user_level < 4 { w.tool = Tool::Browse; }
+            drop(w);
+            let editing = editing_now();
+            if editing != was_editing { was_editing = editing; tick += 1; }
+        }
+        if DIRTY.with(|d| std::mem::take(&mut *d.borrow_mut())) { flush_sound(); tick += 1; }
+        // A paused script (answer, ask, wait): end its wait when the time comes, check `wait until` again.
+        let now = now_ms();
+        if rt().tick(now) { handle_requests(); save(); flush_sound(); tick += 1; }
+        if was_editing { times.clear(); continue; }
+        // `select …` from a script: show it in the field, after the redraw that the command caused.
+        if let Some((f, a, b)) = rt().w.borrow_mut().select_request.take() {
+            let _ = document::eval(&format!("setTimeout(() => {{ const t = document.querySelector('textarea[data-id=\"{f}\"]'); if (t) {{ t.focus({{ preventScroll: true }}); t.setSelectionRange({a}, {b}); }} }}, 80)"));
+        }
+        // Nothing of that while a script is paused: the stack is modal until it finishes.
+        if rt().is_paused() { times.clear(); continue; }
+        // Save only when something was written: these messages can arrive every frame.
+        let before = { let r = rt(); let w = r.w.borrow(); (w.file.journal.len(), w.file.journal.last().map(|c| format!("{:?}", c.new))) };
+        let mut changed = rt().run_timers(now) > 0;
+        let (pressed, hover, down) = { let r = rt(); let w = r.w.borrow(); (w.pressed, w.hover, w.mouse_down) };
+        // Sent every frame, so only along a path where a script handles them.
+        if let (Some(p), true) = (pressed, down) { if rt().handles(p, "mouseStillDown") { changed |= rt().send_with(p, "mouseStillDown", vec![]); } }
+        if let Some(h) = hover { if rt().handles(h, "mouseWithin") { changed |= rt().send_with(h, "mouseWithin", vec![]); } }
+        // About ten times a second: idle, for stacks that handle it.
+        if now - last_idle >= 100.0 { last_idle = now; changed |= rt().idle(); }
+        if changed {
+            let after = { let r = rt(); let w = r.w.borrow(); (w.file.journal.len(), w.file.journal.last().map(|c| format!("{:?}", c.new))) };
+            handle_requests();
+            if after != before { save(); }
+            flush_sound();
+            tick += 1;
+        }
+        let mut ran = false;
+        cost = (cost * 7 + timed(|| ran = rt().frame())) / 8;
+        flush_sound();
+        if !ran { times.clear(); continue; }
+        times.push_back(t);
+        if times.len() > 60 { times.pop_front(); }
+        if times.len() > 1 {
+            let fps = (times.len() - 1) as f64 * 1000.0 / (times.back().unwrap() - times.front().unwrap());
+            stats.set((fps, cost));
+        }
+        tick += 1;
     }
-    if let Some((tool, size, filled, pts)) = live { shape(tool, size, filled, &pts); }
-    out.push_str("</svg>");
-    out
+}
+
+/// Text selection in fields (for the selection, selectedText, type), the window's size and place (the screenRect,
+/// sizeWindow, moveWindow), and the player hidden or shown again (suspend, resume).
+async fn window_events(mut tick: Signal<u32>) {
+    let mut ch = document::eval(r#"
+        document.addEventListener('selectionchange', () => { const a = document.activeElement; if (a && a.dataset && a.dataset.id) dioxus.send(['sel', +a.dataset.id, a.selectionStart, a.selectionEnd]); });
+        let t; window.addEventListener('resize', () => { clearTimeout(t); t = setTimeout(() => dioxus.send(['size', innerWidth, innerHeight, 0]), 150); });
+        dioxus.send(['size', innerWidth, innerHeight, 1]);
+        document.addEventListener('visibilitychange', () => dioxus.send(['vis', document.hidden ? 1 : 0, 0, 0]));
+        let sx = screenX, sy = screenY;
+        dioxus.send(['move', sx, sy, 1]);
+        setInterval(() => { if (screenX !== sx || screenY !== sy) { sx = screenX; sy = screenY; dioxus.send(['move', sx, sy, 0]); } }, 500);
+        await new Promise(() => {});"#);
+    while let Ok((kind, a, b, c)) = ch.recv::<(String, f64, f64, f64)>().await {
+        let r = rt();
+        let card = r.w.borrow().current_card();
+        match kind.as_str() {
+            "sel" => r.w.borrow_mut().selection = Some((a as u32, b as usize, c as usize)),
+            "size" => {
+                TABS.with(|t| for tab in t.borrow().iter() { tab.rt.w.borrow_mut().screen = (a, b); });
+                if c == 0.0 && !editing_now() { r.send_with(card, "sizeWindow", vec![]); save(); tick += 1; }
+            }
+            "move" => {
+                TABS.with(|t| for tab in t.borrow().iter() { tab.rt.w.borrow_mut().window_loc = (a, b); });
+                if c == 0.0 && !editing_now() { r.send_with(card, "moveWindow", vec![]); save(); tick += 1; }
+            }
+            "vis" => { r.send_with(card, if a == 1.0 { "suspend" } else { "resume" }, vec![]); handle_requests(); save(); tick += 1; }
+            _ => {}
+        }
+    }
+}
+
+/// On the web: restore the file system from the browser's private storage, then let the first stack open
+/// (its openStack handler sees the restored files).
+#[cfg(target_arch = "wasm32")]
+async fn restore_browser_disk(tick: Signal<u32>) {
+    let mut ch = document::eval(r#"
+        const out = [];
+        async function walk(dir, prefix) {
+            for await (const [name, h] of dir.entries()) {
+                if (h.kind === 'file') out.push([prefix + '/' + name, await (await h.getFile()).text(), true]);
+                else { out.push([prefix + '/' + name, '', false]); await walk(h, prefix + '/' + name); }
+            }
+        }
+        try { await walk(await navigator.storage.getDirectory(), ''); } catch (e) {}
+        dioxus.send(out);"#);
+    if let Ok(entries) = ch.recv::<Vec<(String, String, bool)>>().await {
+        let fs = shared_fs();
+        for (p, t, is_file) in entries { fs.borrow_mut().preload(&p, if is_file { Some(&t) } else { None }); }
+    }
+    if DEFERRED_OPEN.with(|d| std::mem::take(&mut *d.borrow_mut())) {
+        rt().open_stack(true);
+        after_action(tick);
+    }
+}
+
+/// The local time zone, for the date and the time, in every open stack.
+async fn local_time_zone() {
+    let mut ch = document::eval("dioxus.send(-new Date().getTimezoneOffset())");
+    if let Ok(min) = ch.recv::<f64>().await { TABS.with(|t| for tab in t.borrow().iter() { tab.rt.w.borrow_mut().tz_offset_min = min as i64; }); }
+}
+
+/// Test hook (desktop): HC_AUTODRIVE names a JavaScript file of UI actions to run inside this window;
+/// what it sends back is appended to HC_AUTODRIVE_OUT. Without the variable this does nothing.
+#[cfg(not(target_arch = "wasm32"))]
+async fn autodrive() {
+    let Ok(script) = std::env::var("HC_AUTODRIVE") else { return };
+    let out = std::env::var("HC_AUTODRIVE_OUT").unwrap_or_else(|_| "autodrive.log".into());
+    let js = std::fs::read_to_string(&script).unwrap_or_default();
+    let mut ch = document::eval(&js);
+    while let Ok(line) = ch.recv::<String>().await {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&out) { let _ = writeln!(f, "{line}"); }
+    }
+}
+
+/// Browser audio: when a sound ends, `the sound` clears and scripts get `soundDone`.
+async fn sound_events(mut tick: Signal<u32>) {
+    let mut ch = document::eval(SOUND_JS);
+    while let Ok(m) = ch.recv::<String>().await {
+        if m != "ended" { rt().w.borrow_mut().log.push(format!("sound: {m}")); }
+        rt().sound_finished();
+        flush_sound();
+        save();
+        tick += 1;
+    }
+}
+
+/// "+ Picture": add the chosen images to the stack and place each on this card (the last one is selected).
+async fn add_pictures(files: Vec<dioxus::html::FileData>, mut sel: Signal<Option<u32>>, mut multi: Signal<Vec<u32>>, tick: Signal<u32>) {
+    for f in files {
+        let Ok(bytes) = f.read_bytes().await else { continue };
+        let (name, mime) = asset_name_and_type(&f.name());
+        let r = rt();
+        let id = {
+            let mut w = r.w.borrow_mut();
+            w.begin();
+            w.add_asset(&name, &mime, bytes.to_vec());
+            let card = w.current_card();
+            let id = w.create(Kind::Picture, &name, Some(card), None);
+            let (cw, ch) = (w.file.width, w.file.height);
+            for (k, v) in [("left", 0), ("top", 0), ("width", cw), ("height", ch - 60)] { w.set(id, k, Value::Int(v), false); }
+            w.set(id, "picture", Value::Str(name.clone()), false);
+            id
+        };
+        sel.set(Some(id));
+        multi.set(vec![id]);
+    }
+    after_action(tick);
+}
+
+/// "+ Sound": add the chosen sounds to the stack.
+async fn add_sounds(files: Vec<dioxus::html::FileData>, tick: Signal<u32>) {
+    for f in files {
+        let Ok(bytes) = f.read_bytes().await else { continue };
+        let (name, mime) = asset_name_and_type(&f.name());
+        let r = rt();
+        { let mut w = r.w.borrow_mut(); w.begin(); w.add_asset(&name, &mime, bytes.to_vec()); }
+        r.w.borrow_mut().log.push(format!("added sound \"{name}\": play it with  play \"{name}\";"));
+        SENT.with(|s| s.borrow_mut().remove(&name));
+    }
+    after_action(tick);
+}
+
+/// A click in a locked field: where in the text it landed (a read-only textarea still places the caret),
+/// for clickText / clickLine and autoSelect; then mouseUp.
+async fn click_locked_field(id: u32, tick: Signal<u32>) {
+    let mut ch = document::eval(&format!("const t = document.querySelector('textarea[data-id=\"{id}\"]'); dioxus.send(t ? t.selectionStart : -1)"));
+    let at = ch.recv::<f64>().await.ok().filter(|a| *a >= 0.0).map(|a| a as usize);
+    rt().click_field(id, at);
+    after_action(tick);
+}
+
+/// The card's paint, between the background parts and the card parts, and with a paint tool the surface that
+/// turns drags into strokes. It owns the stroke being painted: while the mouse moves only that stroke redraws,
+/// not the card's saved strokes (`PaintStatic` only renders again when the card's paint changes).
+#[component]
+fn PaintLayer(paint: String, tool: Tool, line_size: i64, filled: bool, width: i64, height: i64, painting: bool, on_stroke: EventHandler<Vec<(f64, f64)>>) -> Element {
+    let mut stroke = use_signal(Vec::<(f64, f64)>::new);
+    let live = {
+        let pts = stroke.read();
+        (painting && !pts.is_empty()).then(|| svg(width, height, &stroke_svg(&Stroke { tool, size: line_size, filled, pts: pts.clone() })))
+    };
+    let mut finish = move || { let pts = std::mem::take(&mut *stroke.write()); if !pts.is_empty() { on_stroke.call(pts); } };
+    rsx! {
+        PaintStatic { paint, width, height }
+        if let Some(markup) = live { div { class: "paintlayer", dangerous_inner_html: "{markup}" } }
+        if painting {
+            div { class: "paintcatch",
+                onmousedown: move |e| { e.stop_propagation(); let p = e.element_coordinates(); stroke.set(vec![(p.x, p.y)]); },
+                onmousemove: move |e| { if !stroke.read().is_empty() { let p = e.element_coordinates(); stroke.write().push((p.x, p.y)); } },
+                onmouseup: move |e| { e.stop_propagation(); finish(); },
+                onmouseleave: move |_| finish(),
+                onclick: move |e| e.stop_propagation(),
+            }
+        }
+    }
+}
+
+/// The card's saved strokes as SVG.
+#[component]
+fn PaintStatic(paint: String, width: i64, height: i64) -> Element {
+    let body: String = Stroke::parse_all(&paint).iter().map(stroke_svg).collect();
+    let markup = svg(width, height, &body);
+    rsx! { div { class: "paintlayer", dangerous_inner_html: "{markup}" } }
+}
+
+fn svg(w: i64, h: i64, body: &str) -> String {
+    format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">{body}</svg>"#)
+}
+
+/// One stroke as SVG. Black ink on the card, as in HyperCard; the eraser paints the card colour.
+fn stroke_svg(s: &Stroke) -> String {
+    let (tool, size, pts) = (s.tool, s.size, &s.pts[..]);
+    let (Some(&a), Some(&b)) = (pts.first(), pts.last()) else { return String::new() };
+    let ink = "#111";
+    let poly = |pts: &[(f64, f64)]| pts.iter().map(|(x, y)| format!("{x:.0},{y:.0}")).collect::<Vec<_>>().join(" ");
+    let fill = if s.filled { ink } else { "none" };
+    let (x, y, bw, bh) = (a.0.min(b.0), a.1.min(b.1), (a.0 - b.0).abs(), (a.1 - b.1).abs());
+    let line = |width: f64, color: &str, extra: &str| if pts.len() == 1 {
+        format!(r#"<circle cx="{:.0}" cy="{:.0}" r="{}" fill="{color}"/>"#, a.0, a.1, (width / 2.0).max(0.5))
+    } else {
+        format!(r#"<polyline points="{}" fill="none" stroke="{color}" stroke-width="{width}" stroke-linecap="round" stroke-linejoin="round" {extra}/>"#, poly(pts))
+    };
+    match tool {
+        Tool::Pencil => line(1.0, ink, ""),
+        Tool::Brush => line(6.0, ink, ""),
+        Tool::Eraser => line(14.0, "#fff", ""),
+        Tool::Spray => line(8.0, ink, r#"stroke-dasharray="0.5 4" opacity="0.7""#),
+        Tool::Curve | Tool::Polygon => line(size as f64, ink, ""),
+        Tool::Line => format!(r#"<line x1="{:.0}" y1="{:.0}" x2="{:.0}" y2="{:.0}" stroke="{ink}" stroke-width="{size}" stroke-linecap="round"/>"#, a.0, a.1, b.0, b.1),
+        Tool::Rectangle => format!(r#"<rect x="{x:.0}" y="{y:.0}" width="{bw:.0}" height="{bh:.0}" fill="{fill}" stroke="{ink}" stroke-width="{size}"/>"#),
+        Tool::RoundRect => format!(r#"<rect x="{x:.0}" y="{y:.0}" width="{bw:.0}" height="{bh:.0}" rx="10" fill="{fill}" stroke="{ink}" stroke-width="{size}"/>"#),
+        Tool::Oval => format!(r#"<ellipse cx="{:.0}" cy="{:.0}" rx="{:.0}" ry="{:.0}" fill="{fill}" stroke="{ink}" stroke-width="{size}"/>"#, x + bw / 2.0, y + bh / 2.0, bw / 2.0, bh / 2.0),
+        Tool::RegularPolygon => {
+            // Drawn from its centre, as in HyperCard: six sides through the end point.
+            let r = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+            let t0 = (b.1 - a.1).atan2(b.0 - a.0);
+            let v: Vec<(f64, f64)> = (0..6).map(|k| { let t = t0 + k as f64 * std::f64::consts::PI / 3.0; (a.0 + r * t.cos(), a.1 + r * t.sin()) }).collect();
+            format!(r#"<polygon points="{}" fill="{fill}" stroke="{ink}" stroke-width="{size}"/>"#, poly(&v))
+        }
+        _ => String::new(),
+    }
 }
 
 /// Asset name from a file name (without extension) and its media type from the extension.
