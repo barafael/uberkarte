@@ -1,7 +1,7 @@
 //! H3: how much of HyperTalk's vocabulary maps onto this language. Reads tests/keywords.toml,
 //! runs every `ours` snippet in a fresh stack, checks every `test` reference, prints the tally.
 use serde::Deserialize;
-use stack_core::{demo, Rt};
+use stack_core::{demo, Rt, Waiting};
 use std::collections::BTreeMap;
 
 #[derive(Deserialize)]
@@ -23,6 +23,15 @@ fn keyword_coverage() {
         if !r.ours.is_empty() {
             let rt = Rt::with_home(demo::address_book(), Some(demo::home()));
             rt.exec(&r.ours);
+            // A snippet that pauses (answer, ask, wait) gets the first button, the default text, or its time.
+            for _ in 0..20 {
+                match rt.waiting() {
+                    Some(Waiting::Dialog) => { let b = rt.w.borrow().dialog_buttons.first().cloned().or_else(|| rt.w.borrow().dialog_ask.clone()).unwrap_or_else(|| "OK".into()); rt.reply(&b); }
+                    Some(_) => { rt.tick(f64::MAX); }
+                    None => break,
+                }
+            }
+            if rt.is_paused() { failures.push(format!("{}: `{}` is still waiting", r.id, r.ours)); }
             let err = rt.w.borrow().last_error.clone();
             if let Some(e) = err { failures.push(format!("{}: `{}` failed: {e}", r.id, r.ours)); }
         }

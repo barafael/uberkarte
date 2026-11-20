@@ -507,13 +507,17 @@ fn App() -> Element {
             if DIRTY.with(|d| std::mem::take(&mut *d.borrow_mut())) { flush_sound(); tick += 1; }
             #[cfg(not(target_arch = "wasm32"))]
             if deliver_fetches() { flush_sound(); tick += 1; }
+            // A paused script (answer, ask, wait): end its wait when the time comes, check `wait until` again.
+            let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0);
+            if rt().tick(now) { handle_requests(); save(); flush_sound(); tick += 1; }
             if edit() { times.clear(); continue; }
             // `select …` from a script: show it in the field, after the redraw that the command caused.
             if let Some((f, a, b)) = rt().w.borrow_mut().select_request.take() {
                 let _ = document::eval(&format!("setTimeout(() => {{ const t = document.querySelector('textarea[data-id=\"{f}\"]'); if (t) {{ t.focus({{ preventScroll: true }}); t.setSelectionRange({a}, {b}); }} }}, 80)"));
             }
             // Browse mode: due `send … in` messages, then mouseStillDown / mouseWithin, then frame.
-            let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0);
+            // Nothing of that while a script is paused: the stack is modal until it finishes.
+            if rt().is_paused() { times.clear(); continue; }
             // Save only when something was written: these messages can arrive every frame.
             let before = { let r = rt(); let w = r.w.borrow(); (w.file.journal.len(), w.file.journal.last().map(|c| format!("{:?}", c.new))) };
             let mut changed = rt().run_timers(now) > 0;
@@ -1159,7 +1163,7 @@ fn App() -> Element {
                                             oninput: move |e| ask_text.set(e.value()) }
                                     }
                                     div { class: "row",
-                                        button { class: "t", onclick: move |_| { file_dir.set(None); rt().reply(""); done(); }, "Cancel" }
+                                        button { class: "t", onclick: move |_| { file_dir.set(None); rt().cancel(); done(); }, "Cancel" }
                                         if saving {
                                             { let d2 = dir.clone(); rsx! { button { class: "t on", onclick: move |_| { let p = stack_core::files::resolve_path(&d2, &ask_text()); file_dir.set(None); rt().reply(&p); done(); }, "Save" } } }
                                         }
@@ -1171,7 +1175,7 @@ fn App() -> Element {
                                 oninput: move |e| ask_text.set(e.value()),
                                 onkeydown: move |e| { e.stop_propagation(); if e.key() == Key::Enter { rt().reply(&ask_text()); done(); } } }
                             div { class: "row",
-                                button { class: "t", onclick: move |_| { rt().reply(""); done(); }, "Cancel" }
+                                button { class: "t", onclick: move |_| { rt().cancel(); done(); }, "Cancel" }
                                 button { class: "t on", onclick: move |_| { rt().reply(&ask_text()); done(); }, "OK" }
                             }
                         } else {

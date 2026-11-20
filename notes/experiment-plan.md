@@ -988,3 +988,81 @@ variable the hook does nothing. The script used is
 
 **Still seen, cosmetic:** at this display scale the edit-mode toolbar wraps,
 putting "card 3 of 3 ▶" on a second line.
+
+## Hosting (2026-11-19/20)
+
+Published by GitHub Actions to https://barafael.github.io/uberkarte/: the
+corpus explorer at the root (Leptos and SurrealDB in WebAssembly) and the web
+player under `/player/`.
+- The explorer fills the window. The questions and the results scroll on their
+  own.
+- The Self Test's fetch check now loads this repository's README from
+  raw.githubusercontent.com. example.org sends no
+  `Access-Control-Allow-Origin` header, so a browser refuses to let the page
+  read it.
+
+### Scripts that pause: answer, ask, wait (2026-11-20)
+
+The owner asked for more HyperTalk. The largest gap was that scripts could not
+wait:
+- `answer` and `ask` sent their reply back as an `answered`/`asked` message;
+- `wait` did not exist (`send … in` stood in for it).
+
+**Now, as in HyperCard:**
+- `answer … with "A" or "B"`, `ask … with …`, `answer file` and `ask file`
+  put the reply into `it`.
+- Cancel leaves `it` empty and sets the result to "Cancel".
+- `wait N [ticks|seconds|milliseconds]` works (ticks if no unit), with an
+  optional `for`.
+- `wait until <condition>` and `wait while <condition>` work.
+
+**How:**
+- A Rhai call cannot be suspended, so a script that must wait stops with an
+  error a script's `try` can't catch.
+- When the wait is over, the runtime first undoes the run:
+  - the journal is rolled back to where the run started, including automatic
+    changes (a write merged into an older entry records the value it
+    replaced);
+  - runtime state outside the journal is restored: the current card, globals,
+    timers, open files, canvas drawings, the random seed and so on.
+- Then the run starts again from what set it going (a click, a key, a message
+  box line).
+- On the second run, every input from outside comes from a tape recorded on the
+  first: the time, the mouse, keys, `the sound`, every file-system call, and
+  the dialog reply. So the run takes the same path, and file writes are not
+  done again.
+- Sounds, fetches and `go to stack` queued again before the pause point are
+  dropped.
+- While a script is paused the stack is modal, as in HyperCard: clicks, keys,
+  timers and `frame` wait.
+- Fetch results and `soundDone` that arrive during a pause are delivered
+  afterwards.
+- `frame` and `errorDialog` handlers can't pause (an error says so).
+
+**Costs:**
+- A handler that waits N times reruns its start N times, so a `repeat … wait 1
+  tick` animation gets slower the longer it runs. `frame` and `send … in` stay
+  the tools for animation.
+- Writes to Home or to a library stack are not journaled, so a rerun repeats
+  them.
+- If a rerun reads something that is not on the tape, the message box logs
+  "note: a paused script ran differently …".
+
+**Checks:**
+- **path.rs:** 4 new tests (dialogs into `it`, nothing done twice, `wait` for
+  time and for a condition, and that `frame` can't pause); 37 tests pass. The
+  "nothing done twice" test covers: a global incremented once, a file appended
+  to once, the same random number after the pause, two dialogs in a loop, and
+  one Undo taking back the whole click.
+- **Keywords:** the keyword test answers dialogs and ends waits, so pausing
+  snippets run to the end. `answer`, `ask`, `wait` and `it` are now clean:
+  121/149 clean (81%), 88% excluding the n/a rows.
+- **Self Test:** the run-all test waits 3 ticks, which reruns the whole
+  29-check run including its file write; 29/29 pass. The manual card has "7
+  Wait and count".
+- **Web player:** checked in headless Chromium:
+  - run-all passes 29 of 29;
+  - "Wait and count" shows 1, 2, 3 a second apart, then the dialog, and records
+    the answer;
+  - `ask` handles both Cancel and OK;
+  - no console errors.

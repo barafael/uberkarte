@@ -262,11 +262,10 @@ pub struct World {
     pub result: String,
     pub mouse_down: bool,
     pub click_loc: (f64, f64),
-    /// `answer … with "A" or "B"` buttons, `ask` default text (Some = an ask dialog), and the object
-    /// that gets the reply as an `answered` / `asked` message.
+    /// `answer … with "A" or "B"` buttons and `ask` default text (Some = an ask dialog). The script waits
+    /// for the reply, which goes into `it`.
     pub dialog_buttons: Vec<String>,
     pub dialog_ask: Option<String>,
-    pub dialog_reply_to: Option<u32>,
     /// `send … in N seconds`: (due time in ms since 1970, object, message).
     pub timers: Vec<(f64, u32, String)>,
     /// `push card` / `pop card`.
@@ -305,6 +304,10 @@ pub struct World {
     /// The part under the pointer and the part being pressed (for mouseWithin, mouseStillDown).
     pub hover: Option<u32>,
     pub pressed: Option<u32>,
+    /// Where the running script's journal entries start. A write merged into an older entry records the
+    /// value it replaced in `floor_merges`, so `rollback` can take a paused script's changes back.
+    pub journal_floor: usize,
+    pub floor_merges: Vec<(usize, Option<Value>)>,
 }
 
 /// HyperTalk property names are case-insensitive, and some have HyperTalk spellings for ours.
@@ -337,11 +340,11 @@ pub struct GoStack { pub path: String, pub card: Option<Value>, pub new_window: 
 impl World {
     pub fn new(file: StackFile) -> Self { World { file, log: vec![], dialog: None, last_error: None, auto_depth: 0, mouse: (0.0, 0.0), keys: Default::default(), draw: Default::default(), home: None, sound: None, sound_cmds: vec![], effect: None, effect_seq: 0, locked: false,
         item_delim: ",".into(), lock_messages: false, result: String::new(), mouse_down: false, click_loc: (0.0, 0.0),
-        dialog_buttons: vec![], dialog_ask: None, dialog_reply_to: None, timers: vec![], push_list: vec![], edit_request: None, hover: None, pressed: None,
+        dialog_buttons: vec![], dialog_ask: None, timers: vec![], push_list: vec![], edit_request: None, hover: None, pressed: None,
         selection: None, select_request: None, focused: None, user_level: 5, tz_offset_min: 0, mouse_click: false, click_text_at: None,
         fs: std::rc::Rc::new(std::cell::RefCell::new(crate::files::default_fs())), fs_base: String::new(), open_files: Default::default(),
         dialog_file: None, url_requests: vec![], url_cache: Default::default(),
-        libs: vec![], go_stack: None, stacks_dir: String::new(), open_stacks: vec![] } }
+        libs: vec![], go_stack: None, stacks_dir: String::new(), open_stacks: vec![], journal_floor: 0, floor_merges: vec![] } }
 
     /// Find a stack file by name or path: the stack's own folder, then the stacks folder, then the search
     /// folders kept in Home (`the searchPaths`, one per line). `Name` also matches `Name.stack`.
@@ -471,8 +474,12 @@ impl World {
         let auto = self.auto_depth > 0;
         // Typing and dragging fold into one entry; so do repeated automatic writes (a score updated every frame).
         if merge || auto {
+            let below_floor = self.file.journal.len() <= self.journal_floor;
             if let Some(last) = self.file.journal.last_mut() {
-                if last.kind == "set" && last.obj == oid && last.key == k && last.auto == auto { last.new = Some(new); return; }
+                if last.kind == "set" && last.obj == oid && last.key == k && last.auto == auto {
+                    if below_floor { let i = self.file.journal.len() - 1; let prev = self.file.journal[i].new.clone(); self.floor_merges.push((i, prev)); self.file.journal[i].new = Some(new); return; }
+                    last.new = Some(new); return;
+                }
             }
         }
         self.file.journal.push(Change { txn, kind: "set".into(), obj: oid, key: k, old, new: Some(new), index: None, snapshot: None, auto });
@@ -648,26 +655,46 @@ impl World {
             if c.txn < txn { break; }
             if c.txn == txn && !c.auto { taken.push(self.file.journal.remove(i)); }
         }
-        for c in taken {
-            match c.kind.as_str() {
-                "set" => { self.raw_set(c.obj, &c.key, c.old); if c.key == "script" { recompile.push(c.obj); } }
-                "create" => { self.file.objs.retain(|o| o.id != c.obj); recompile.push(c.obj); }
-                "delete" => if let Some(o) = c.snapshot { let i = c.index.unwrap_or(0).min(self.file.objs.len()); self.file.objs.insert(i, o); recompile.push(c.obj); }
-                "parent" => { let old = c.old.map(|v| v.int() as u32); if let Some(o) = self.obj_mut(c.obj) { o.parent = old; } }
-                "asset" => { self.file.assets.retain(|a| a.name != c.key); self.file.blobs.remove(&c.key); }
-                "order" => {
-                    let old: Vec<u32> = c.key.split(',').filter_map(|x| x.parse().ok()).collect();
-                    let slots: Vec<usize> = self.file.objs.iter().enumerate().filter(|(_, o)| o.kind == Kind::Card).map(|(i, _)| i).collect();
-                    let by_id: std::collections::HashMap<u32, Obj> = self.file.objs.iter().filter(|o| o.kind == Kind::Card).map(|o| (o.id, o.clone())).collect();
-                    if old.len() == slots.len() && old.iter().all(|i| by_id.contains_key(i)) {
-                        for (slot, id) in slots.iter().zip(&old) { self.file.objs[*slot] = by_id[id].clone(); }
-                    }
-                }
-                _ => {}
-            }
-        }
+        for c in taken { self.revert(c, &mut recompile); }
         if self.obj(self.file.current_card).is_none() { self.file.current_card = self.cards().first().copied().unwrap_or(0); }
         recompile
+    }
+
+    /// Take back every journal entry from `mark` on, automatic or not, newest first (a paused script's
+    /// changes, before it runs again). Returns the ids whose scripts changed.
+    pub fn rollback(&mut self, mark: usize) -> Vec<u32> {
+        let mut recompile = vec![];
+        while self.file.journal.len() > mark {
+            let c = self.file.journal.pop().unwrap();
+            self.revert(c, &mut recompile);
+        }
+        for (i, prev) in std::mem::take(&mut self.floor_merges).into_iter().rev() {
+            let Some(c) = self.file.journal.get_mut(i) else { continue };
+            c.new = prev.clone();
+            let (obj, key) = (c.obj, c.key.clone());
+            self.raw_set(obj, &key, prev);
+            if key == "script" { recompile.push(obj); }
+        }
+        recompile
+    }
+
+    fn revert(&mut self, c: Change, recompile: &mut Vec<u32>) {
+        match c.kind.as_str() {
+            "set" => { self.raw_set(c.obj, &c.key, c.old); if c.key == "script" { recompile.push(c.obj); } }
+            "create" => { self.file.objs.retain(|o| o.id != c.obj); recompile.push(c.obj); }
+            "delete" => if let Some(o) = c.snapshot { let i = c.index.unwrap_or(0).min(self.file.objs.len()); self.file.objs.insert(i, o); recompile.push(c.obj); }
+            "parent" => { let old = c.old.map(|v| v.int() as u32); if let Some(o) = self.obj_mut(c.obj) { o.parent = old; } }
+            "asset" => { self.file.assets.retain(|a| a.name != c.key); self.file.blobs.remove(&c.key); }
+            "order" => {
+                let old: Vec<u32> = c.key.split(',').filter_map(|x| x.parse().ok()).collect();
+                let slots: Vec<usize> = self.file.objs.iter().enumerate().filter(|(_, o)| o.kind == Kind::Card).map(|(i, _)| i).collect();
+                let by_id: std::collections::HashMap<u32, Obj> = self.file.objs.iter().filter(|o| o.kind == Kind::Card).map(|o| (o.id, o.clone())).collect();
+                if old.len() == slots.len() && old.iter().all(|i| by_id.contains_key(i)) {
+                    for (slot, id) in slots.iter().zip(&old) { self.file.objs[*slot] = by_id[id].clone(); }
+                }
+            }
+            _ => {}
+        }
     }
 }
 

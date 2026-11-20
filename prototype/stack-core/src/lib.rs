@@ -6,4 +6,4 @@ pub mod script;
 pub mod demo;
 
 pub use model::{canon_prop, migrate_joins, migrate_logic, Asset, Change, Kind, Obj, Shape, SoundCmd, StackFile, Value, World, FORMAT, HOME, LIB0, GoStack};
-pub use script::{hypertalk_blocks, hypertalk_words, Rt};
+pub use script::{hypertalk_blocks, hypertalk_words, Rt, Waiting};

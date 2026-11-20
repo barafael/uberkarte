@@ -8,16 +8,15 @@ ours = "put 5 into n; add 3 to n; subtract 1 from n; multiply n by 2; divide n b
 
 [[kw]]
 id = "cmd_answer"
-cls = "partial"
-ours = "answer \"hi\"; answer \"Save?\" with \"Yes\" or \"No\";"
-note = "the clicked button arrives as an answered message, not in it"
+cls = "clean"
+ours = "answer \"hi\"; answer \"Save?\" with \"Yes\" or \"No\"; if it is not \"Yes\" { throw \"wrong button\"; }"
+test = "answer_and_ask_wait_for_the_reply_in_it"
 
 [[kw]]
 id = "cmd_ask"
-cls = "partial"
-ours = "ask \"Name?\" with \"Ada\";"
-note = "the reply arrives as an asked message, not in it"
-test = "dialogs_reply_by_message"
+cls = "clean"
+ours = "ask \"Name?\" with \"Ada\"; if it is not \"Ada\" { throw \"wrong reply\"; }"
+test = "answer_and_ask_wait_for_the_reply_in_it"
 
 [[kw]]
 id = "cmd_choose"
@@ -160,9 +159,10 @@ note = "go … with <effect> instead of a separate visual effect command"
 
 [[kw]]
 id = "cmd_wait"
-cls = "renamed"
-ours = "send \"help\" in 2 seconds;"
-note = "send … in N seconds|ticks; scripts cannot pause"
+cls = "clean"
+ours = "wait 2 ticks; wait for 1 second; wait until the mouse is up; wait while the mouse is down;"
+test = "wait_for_time_and_for_a_condition"
+note = "the script runs again from its start when the wait ends, reading back what it saw (see a_paused_script_does_nothing_twice)"
 
 [[kw]]
 id = "cmd_mark"
@@ -423,9 +423,8 @@ ours = "put the name of me into n;"
 
 [[kw]]
 id = "sp_it"
-cls = "partial"
-ours = "get 5; put it into x;"
-note = "filled by get; answer and ask do not fill it"
+cls = "clean"
+ours = "get 5; put it into x; ask \"Name?\" with \"Ada\"; put it into y;"
 
 [[kw]]
 id = "sp_target"

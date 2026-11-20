@@ -488,18 +488,23 @@ end mouseUp
 -- Called by runAll: a function in the stack script, reached from this button.
 on probe
   check "function handler on the message path", stackTwice(21) = 42
+  -- The whole run pauses here and goes on three ticks later.
+  put the ticks into t0
+  wait 3 ticks
+  check "wait 3 ticks, then go on", the ticks - t0 >= 2
 end probe
 "#;
 
 pub const SELF_TEST_MANUAL: &str = "Manual checks. Click each button and compare with what should happen.\n\n\
 1  Pillars in a new tab: a second tab opens on the dock of Pillars. Close it with ×.\n\
-2  Pick a file: a file dialog lists this stack's folder; the chosen path appears below.\n\
+2  Pick a file: a file dialog lists this stack's folder; the chosen path appears below (or \"no file picked\").\n\
 3  Play notes: you hear four harpsichord notes.\n\
 4  Ask a question: type a name and press OK; it appears below.\n\
 5  Timer: two seconds later, \"timer fired\" appears below.\n\
 6  Fetch a page: the length of this project's README appears below. On the web, only sites that allow cross-origin reads work.\n\
-7  Restart the player and open this stack again: the results of the last run are still there (no Save).\n\
-8  Edit: switch to Edit, change the label or script of a button here, switch back to Browse and use it.";
+7  Wait and count: 1, 2, 3 appear a second apart, then a dialog asks; your answer appears below.\n\
+8  Restart the player and open this stack again: the results of the last run are still there (no Save).\n\
+9  Edit: switch to Edit, change the label or script of a button here, switch back to Browse and use it.";
 
 pub fn self_test() -> StackFile {
     let mut w = World::new(StackFile::new("Self Test", 640, 520));
@@ -538,14 +543,15 @@ pub fn self_test() -> StackFile {
     rect(&mut w, note, [20, 20, 600, 44]);
     w.set(note, "locked", true.into(), false);
     w.set(note, "text", "Manual checks: see the list in the results field after pressing \"List the manual checks\".".into(), false);
-    let buttons: [(&str, &str); 7] = [
+    let buttons: [(&str, &str); 8] = [
         ("List the manual checks", "on mouseUp\n  put manualText() into field \"results\"\nend mouseUp"),
         ("1 Pillars in a new tab", "on mouseUp\n  go to card \"dock\" of stack \"Pillars\" in a new window\nend mouseUp"),
-        ("2 Pick a file", "on mouseUp\n  answer file \"Pick any file\"\nend mouseUp\non answered p\n  put return & \"picked: \" & p after field \"results\"\nend answered"),
+        ("2 Pick a file", "on mouseUp\n  answer file \"Pick any file\"\n  if the result is \"Cancel\" then put return & \"no file picked\" after field \"results\"\n  else put return & \"picked: \" & it after field \"results\"\nend mouseUp"),
         ("3 Play notes", "on mouseUp\n  play \"harpsichord\" tempo 160 \"c4q e g c5h\"\nend mouseUp"),
-        ("4 Ask a question", "on mouseUp\n  ask \"Your name?\" with \"Ada\"\nend mouseUp\non asked n\n  put return & \"name: \" & n after field \"results\"\nend asked"),
+        ("4 Ask a question", "on mouseUp\n  ask \"Your name?\" with \"Ada\"\n  if the result is \"Cancel\" then put return & \"no name\" after field \"results\"\n  else put return & \"name: \" & it after field \"results\"\nend mouseUp"),
         ("5 Timer", "on mouseUp\n  send \"late\" to me in 2 seconds\nend mouseUp\non late\n  put return & \"timer fired\" after field \"results\"\nend late"),
         ("6 Fetch a page", "on mouseUp\n  load url \"https://raw.githubusercontent.com/barafael/uberkarte/main/README.md\"\nend mouseUp\non urlLoaded u, status\n  if status is \"error\" then put return & \"fetch failed: \" & the result after field \"results\"\n  else put return & \"fetched \" & length(url u) & \" characters from \" & u after field \"results\"\nend urlLoaded"),
+        ("7 Wait and count", "on mouseUp\n  repeat with i = 1 to 3\n    put return & \"count \" & i after field \"results\"\n    wait 1 second\n  end repeat\n  answer \"Counted to 3. Did you see each number appear?\" with \"Yes\" or \"No\"\n  put return & \"answered \" & it after field \"results\"\nend mouseUp"),
     ];
     for (i, (name, script)) in buttons.iter().enumerate() {
         let id = w.create(Kind::Button, name, Some(man), None);

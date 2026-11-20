@@ -1,6 +1,6 @@
 //! Script engine: stock Rhai plus English-shaped commands, and the message path.
 //! Path: part -> card -> background -> stack -> built-in. Commands are messages first.
-use crate::model::{canon_prop, GoStack, Kind, Obj, Shape, SoundCmd, StackFile, Value, World, HOME, LIB0};
+use crate::model::{canon_prop, GoStack, Kind, Obj, OpenFile, Shape, SoundCmd, StackFile, Value, World, HOME, LIB0};
 use rhai::{Dynamic, Engine, EvalAltResult, ImmutableString, Position, Scope, AST};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -87,10 +87,186 @@ struct Live { asts: HashMap<u32, Rc<AST>>, errors: HashMap<u32, String>, frames:
     canvas: Vec<u32>,
     /// Variables each handler sets with `put … into <name>`, by object and message. They are
     /// declared when the handler starts, so a `put` inside an `if` block sets a handler-wide local.
-    locals: HashMap<u32, HashMap<String, Vec<String>>> }
+    locals: HashMap<u32, HashMap<String, Vec<String>>>,
+    /// What the running script has seen from outside, for running it again after a pause.
+    tape: Rc<RefCell<Tape>>,
+    /// What a paused script waits for.
+    waiting: Option<Waiting>,
+    /// Where the player's queues stood when a paused script started again: what the script queues
+    /// again before it reaches its pause point (sounds, fetches, …) already happened, and is dropped.
+    settle: Option<Settle> }
 type L = Rc<RefCell<Live>>;
 
-pub struct Rt { pub engine: Engine, pub w: W, live: L }
+pub struct Rt { pub engine: Engine, pub w: W, live: L, paused: RefCell<Option<Paused>>, later: RefCell<Vec<Later>> }
+
+// ---- Pausing: answer, ask and wait ------------------------------------------------------------------
+//
+// A Rhai call cannot be suspended. A script that has to wait for the user (answer, ask) or for time
+// (wait) stops instead, and when the wait is over it runs again from the start of what set it going
+// (a click, a key, a message box line). Before that, everything it changed is rolled back with the
+// journal, and the runtime state it touched is restored. On the second run, everything it reads from
+// outside the stack (the time, the mouse, keys, files, the reply it waited for) comes from the tape
+// recorded on the first run, so it takes the same path; what it did outside the stack (file writes,
+// sounds, fetches) is not done again. When it reaches the pause point it is live again.
+// While a script is paused the stack is modal, as in HyperCard: no other messages are delivered.
+
+/// What a paused script waits for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Waiting {
+    /// A dialog (`answer`, `ask`, `answer file`, `ask file`): the player calls `reply` or `cancel`.
+    Dialog,
+    /// `wait N ticks|seconds`: until this time (ms since 1970).
+    Until(f64),
+    /// `wait until …` / `wait while …`: the condition is checked again at this time (ms since 1970).
+    Poll(f64),
+}
+
+/// Inputs from outside, in the order a script read them.
+#[derive(Default)]
+struct Tape {
+    /// False outside a run that may pause (frame, errorDialog): pausing there is an error.
+    on: bool,
+    entries: Vec<(String, Dynamic)>,
+    pos: usize,
+    replaying: bool,
+    /// Set when a run going again got past what the tape holds.
+    went_live: bool,
+    /// The value the pause point gets when the run going again reaches it (the dialog reply).
+    resume: Option<Dynamic>,
+    /// Set if the run went a different way the second time (it read something not on the tape).
+    diverged: Option<String>,
+}
+
+impl Tape {
+    /// Read an outside input: from the tape when running again, otherwise for real (and recorded).
+    fn io(&mut self, kind: &str, f: impl FnOnce() -> Dynamic) -> Dynamic {
+        if self.replaying {
+            if let Some((k, v)) = self.entries.get(self.pos) {
+                if k == kind { self.pos += 1; return v.clone(); }
+                self.diverged.get_or_insert(format!("it read {kind} where it read {k} before"));
+            }
+            self.entries.truncate(self.pos);
+            self.replaying = false;
+            self.went_live = true;
+        }
+        let v = f();
+        if self.on { self.entries.push((kind.to_string(), v.clone())); self.pos = self.entries.len(); }
+        v
+    }
+    /// At a pause point, past the end of the tape: the run is live again. True when that just happened.
+    fn go_live(&mut self) -> bool {
+        if self.replaying && self.pos >= self.entries.len() { self.replaying = false; self.went_live = true; return true; }
+        false
+    }
+}
+
+#[derive(Clone)]
+struct Settle { sounds: usize, urls: usize, go: Option<GoStack>, edit: Option<u32> }
+
+/// The run reached live again: drop what it queued for the player a second time.
+fn settle(w: &W, live: &L) {
+    let Some(s) = live.borrow_mut().settle.take() else { return };
+    let mut wb = w.borrow_mut();
+    wb.sound_cmds.truncate(s.sounds);
+    wb.url_requests.truncate(s.urls);
+    wb.go_stack = s.go;
+    wb.edit_request = s.edit;
+}
+
+const PAUSED: &str = "\u{2}paused";
+/// Not catchable by `try`: unwinds the whole run.
+fn pause(live: &L, why: Waiting) -> Box<EvalAltResult> {
+    live.borrow_mut().waiting = Some(why);
+    Box::new(EvalAltResult::ErrorTerminated(Dynamic::from(PAUSED), Position::NONE))
+}
+fn is_pause(e: &EvalAltResult) -> bool { matches!(e, EvalAltResult::ErrorTerminated(v, _) if v.clone().into_string().map(|s| s == PAUSED).unwrap_or(false)) }
+
+/// A pause point. Running again after the pause, it returns the reply (Some); the first time, None:
+/// the caller shows its dialog (or sets its timer) and returns `pause(…)`.
+fn pause_point(w: &W, live: &L, kind: &str) -> R<Option<Dynamic>> {
+    let tape = live.borrow().tape.clone();
+    let mut t = tape.borrow_mut();
+    if !t.on { return Err(err("answer, ask and wait cannot pause here: frame and errorDialog handlers run to the end")); }
+    if t.replaying {
+        if let Some((k, v)) = t.entries.get(t.pos).cloned() {
+            if k == kind { t.pos += 1; return Ok(Some(v)); }
+            t.diverged.get_or_insert(format!("it reached {kind} where it reached {k} before"));
+            let p = t.pos;
+            t.entries.truncate(p);
+        }
+    }
+    let now_live = t.go_live();
+    let r = t.resume.take();
+    if let Some(v) = &r { t.entries.push((kind.to_string(), v.clone())); t.pos = t.entries.len(); }
+    drop(t);
+    if now_live { settle(w, live); }
+    Ok(r)
+}
+
+/// A dialog reply goes into `it`; Cancel leaves `it` empty and sets the result to "Cancel".
+fn reply_into_it(ctx: &mut rhai::EvalContext, w: &W, r: Dynamic) -> R<Dynamic> {
+    if r.is_unit() { ctx.scope_mut().set_value("it", Dynamic::from(String::new())); w.borrow_mut().result = "Cancel".into(); }
+    else { ctx.scope_mut().set_value("it", r); w.borrow_mut().result.clear(); }
+    Ok(Dynamic::UNIT)
+}
+
+fn now_ms() -> f64 { web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0) }
+
+/// The file system as a script sees it during a run: every call goes through the tape, so running again
+/// after a pause reads what it read the first time and writes nothing twice.
+struct TapeFs { inner: Rc<RefCell<Box<dyn crate::files::Fs>>>, tape: Rc<RefCell<Tape>> }
+impl TapeFs {
+    fn rec<T: Clone + 'static>(&self, kind: String, f: impl FnOnce() -> T) -> T {
+        self.tape.borrow_mut().io(&kind, || Dynamic::from(f())).cast::<T>()
+    }
+}
+impl crate::files::Fs for TapeFs {
+    fn read(&self, path: &str) -> Result<String, String> { self.rec(format!("read {path}"), || self.inner.borrow().read(path)) }
+    fn read_bytes(&self, path: &str) -> Result<Vec<u8>, String> { self.rec(format!("read bytes {path}"), || self.inner.borrow().read_bytes(path)) }
+    fn write(&mut self, path: &str, text: &str) -> Result<(), String> { self.rec(format!("write {path}"), || self.inner.borrow_mut().write(path, text)) }
+    fn delete(&mut self, path: &str) -> Result<(), String> { self.rec(format!("delete {path}"), || self.inner.borrow_mut().delete(path)) }
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), String> { self.rec(format!("rename {from}"), || self.inner.borrow_mut().rename(from, to)) }
+    fn create_folder(&mut self, path: &str) -> Result<(), String> { self.rec(format!("create folder {path}"), || self.inner.borrow_mut().create_folder(path)) }
+    fn is_file(&self, path: &str) -> bool { self.rec(format!("is file {path}"), || self.inner.borrow().is_file(path)) }
+    fn is_folder(&self, path: &str) -> bool { self.rec(format!("is folder {path}"), || self.inner.borrow().is_folder(path)) }
+    fn list(&self, path: &str) -> Result<(Vec<String>, Vec<String>), String> { self.rec(format!("list {path}"), || self.inner.borrow().list(path)) }
+    fn take_changes(&mut self) -> Vec<(String, String, String)> { self.inner.borrow_mut().take_changes() }
+    fn preload(&mut self, path: &str, text: Option<&str>) { self.inner.borrow_mut().preload(path, text) }
+}
+
+/// What set a run going, so it can run again after a pause.
+enum Entry {
+    /// Messages sent in order to one object (stopping at an error). `auto`: system messages, whose
+    /// changes Undo skips.
+    Send { obj: u32, msgs: Vec<(String, Vec<Dynamic>)>, auto: bool },
+    /// A message box line.
+    Exec(String),
+}
+
+/// Runtime state a run may change outside the journal, taken when it starts.
+struct Snap {
+    mark: usize, txn: u64, next_id: u32, current_card: u32, log_len: usize, result: String, item_delim: String,
+    timers: Vec<(f64, u32, String)>, push_list: Vec<u32>, selection: Option<(u32, usize, usize)>, focused: Option<u32>,
+    user_level: i64, open_files: HashMap<String, OpenFile>, effect: Option<String>, effect_seq: u64, sound: Option<String>,
+    draw: HashMap<u32, Vec<Shape>>, mouse_click: bool, click_loc: (f64, f64), libs: Vec<Obj>, globals: HashMap<String, Dynamic>, seed: u64,
+}
+
+struct Paused { entry: Entry, snap: Snap, tape: Vec<(String, Dynamic)> }
+
+/// Work that arrived while a script was paused (a fetch result, soundDone), done when it finishes.
+type Later = Box<dyn FnOnce(&Rt)>;
+
+/// Read outside state through the tape (the time, the mouse, keys).
+fn taped(live: &L, kind: &str, f: impl FnOnce() -> Dynamic) -> Dynamic {
+    let tape = live.borrow().tape.clone();
+    let mut t = tape.borrow_mut();
+    t.io(kind, f)
+}
+
+/// `the …` properties that come from outside the stack and change on their own.
+const VOLATILE: &[&str] = &["mouseh", "mousev", "mouse", "mouseloc", "sound", "commandkey", "shiftkey", "optionkey", "seconds", "ticks",
+    "date", "short date", "shortdate", "long date", "longdate", "abbreviated date", "abbrev date", "abbreviateddate", "time", "short time",
+    "shorttime", "long time", "longtime", "mouseclick"];
 
 fn err(s: &str) -> Box<EvalAltResult> { Box::new(EvalAltResult::ErrorRuntime(s.into(), Position::NONE)) }
 
@@ -345,10 +521,11 @@ fn ordinal(word: &str, count: usize) -> i64 {
     }
 }
 
-fn rand_u64() -> u64 {
-    thread_local! { static SEED: std::cell::Cell<u64> = std::cell::Cell::new(0x9E3779B97F4A7C15 ^ web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)); }
-    SEED.with(|s| { let mut x = s.get(); x ^= x << 13; x ^= x >> 7; x ^= x << 17; s.set(x); x })
-}
+thread_local! { static SEED: std::cell::Cell<u64> = std::cell::Cell::new(0x9E3779B97F4A7C15 ^ web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)); }
+fn rand_u64() -> u64 { SEED.with(|s| { let mut x = s.get(); x ^= x << 13; x ^= x >> 7; x ^= x << 17; s.set(x); x }) }
+/// A paused script running again draws the same random numbers.
+fn rand_seed() -> u64 { SEED.with(|s| s.get()) }
+fn set_rand_seed(v: u64) { SEED.with(|s| s.set(v)) }
 
 fn build_engine(w: &W, live: &L) -> Engine {
     let mut e = Engine::new();
@@ -787,6 +964,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 }
                 _ => {}
             }
+            let read = || -> R<Dynamic> {
             let wb = w.borrow();
             let key_state = |names: &[&str]| if names.iter().any(|n| wb.keys.contains(*n)) { "down" } else { "up" };
             let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
@@ -847,6 +1025,14 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 }
                 other => return Err(err(&format!("unknown: the {other}"))),
             })
+            };
+            let lower = prop.to_lowercase();
+            if VOLATILE.contains(&lower.as_str()) {
+                let mut failed = None;
+                let v = taped(&live, &format!("the {lower}"), || read().unwrap_or_else(|e| { failed = Some(e); Dynamic::UNIT }));
+                if let Some(e) = failed { return Err(e); }
+                Ok(v)
+            } else { read() }
         });
     }
 
@@ -1112,7 +1298,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
             r.map(|_| Dynamic::UNIT)
         });
     }
-    { let w = w.clone(); e.register_fn("isKeyDown", move |k: &str| w.borrow().keys.contains(k)); }
+    { let (w, live) = (w.clone(), live.clone()); e.register_fn("isKeyDown", move |k: &str| taped(&live, &format!("isKeyDown {k}"), || Dynamic::from(w.borrow().keys.contains(k))).as_bool().unwrap_or(false)); }
 
     // go next | prev | first | last | to card <name or number>  [with <effect> [<direction>]]   (a command)
     { let (w, live) = (w.clone(), live.clone());
@@ -1263,8 +1449,7 @@ fn build_engine(w: &W, live: &L) -> Engine {
 
     // answer <expr>   (a command)
     { let (w, live) = (w.clone(), live.clone());
-      // answer <expr> [with "A" [or "B" [or "C"]]]: the clicked button comes back in an `answered` message
-      // to the object that asked. Scripts cannot wait for the user, so the reply is a message.
+      // answer <expr> [with "A" [or "B" [or "C"]]]: the script waits; the clicked button goes into `it`.
       e.register_custom_syntax_with_state_raw("answer",
         |syms: &[ImmutableString], look: &str, state: &mut Dynamic| {
             if syms.len() == 1 && look == "file" { *state = Dynamic::from(true); return Ok(Some("file".into())); }
@@ -1276,35 +1461,35 @@ fn build_engine(w: &W, live: &L) -> Engine {
                 4 | 6 => if look == "or" { Some("or".into()) } else { None },
                 _ => None,
             })
-        }, false,
+        }, true,
         move |ctx, inputs, state| {
             let v = ctx.eval_expression_tree(&inputs[0])?;
             if state.as_bool().unwrap_or(false) {
-                // answer file "prompt": the chosen path comes back in an `answered` message (empty if cancelled)
-                let from = me(&w, &live);
+                // answer file "prompt": the chosen path goes into `it` (empty, and the result "Cancel", if cancelled)
+                if let Some(r) = pause_point(&w, &live, "answer file")? { return reply_into_it(ctx, &w, r); }
                 let mut wb = w.borrow_mut();
                 let folder = wb.path(".");
                 wb.dialog = Some(v.to_string());
                 wb.dialog_buttons = vec![];
                 wb.dialog_ask = None;
                 wb.dialog_file = Some((false, folder));
-                wb.dialog_reply_to = Some(from);
-                return Ok(Dynamic::UNIT);
+                return Err(pause(&live, Waiting::Dialog));
             }
             let buttons: Vec<String> = inputs[1..].iter().filter_map(|i| i.get_string_value().map(String::from)).collect();
             let from = me(&w, &live);
-            if !dispatch(ctx.engine(), &w, &live, from, "answer", vec![v.clone()])? {
-                let mut wb = w.borrow_mut();
-                wb.dialog = Some(v.to_string());
-                wb.dialog_buttons = buttons;
-                wb.dialog_ask = None;
-                wb.dialog_reply_to = Some(from);
-            }
-            Ok(Dynamic::UNIT)
+            // A handler for `answer` on the path can take it instead of the dialog.
+            if dispatch(ctx.engine(), &w, &live, from, "answer", vec![v.clone()])? { return Ok(Dynamic::UNIT); }
+            if let Some(r) = pause_point(&w, &live, "answer")? { return reply_into_it(ctx, &w, r); }
+            let mut wb = w.borrow_mut();
+            wb.dialog = Some(v.to_string());
+            wb.dialog_buttons = buttons;
+            wb.dialog_ask = None;
+            Err(pause(&live, Waiting::Dialog))
         });
     }
 
-    // ask <expr> [with <default>]: the typed text comes back in an `asked` message (empty if cancelled)
+    // ask [file] <expr> [with <default>]: the script waits; the typed text (or path) goes into `it`.
+    // Cancel leaves `it` empty and sets the result to "Cancel".
     { let (w, live) = (w.clone(), live.clone());
       e.register_custom_syntax_with_state_raw("ask",
         |syms: &[ImmutableString], look: &str, state: &mut Dynamic| {
@@ -1312,19 +1497,63 @@ fn build_engine(w: &W, live: &L) -> Engine {
             if syms.len() == 1 && look == "file" { *state = Dynamic::from(true); return Ok(Some("file".into())); }
             let k = if state.as_bool().unwrap_or(false) { syms.len() - 1 } else { syms.len() };
             Ok(match k { 1 => Some("$expr$".into()), 2 => if look == "with" { Some("with".into()) } else { None }, 3 => Some("$expr$".into()), _ => None })
-        }, false,
+        }, true,
         move |ctx, inputs, state| {
             let file = state.as_bool().unwrap_or(false);
             let q = ctx.eval_expression_tree(&inputs[0])?.to_string();
             let def = if inputs.len() > 1 { ctx.eval_expression_tree(&inputs[1])?.to_string() } else { String::new() };
-            let from = me(&w, &live);
+            if let Some(r) = pause_point(&w, &live, if file { "ask file" } else { "ask" })? { return reply_into_it(ctx, &w, r); }
             let mut wb = w.borrow_mut();
             wb.dialog = Some(q);
             wb.dialog_buttons = vec![];
             wb.dialog_ask = Some(def);
             wb.dialog_file = if file { Some((true, wb.path("."))) } else { None };
-            wb.dialog_reply_to = Some(from);
-            Ok(Dynamic::UNIT)
+            Err(pause(&live, Waiting::Dialog))
+        });
+    }
+
+    // wait [for] <n> [ticks|seconds|milliseconds]   (ticks if no unit, as in HyperCard)
+    // wait until <condition>   /   wait while <condition>
+    { let (w, live) = (w.clone(), live.clone());
+      e.register_custom_syntax_with_state_raw("wait",
+        |syms: &[ImmutableString], look: &str, state: &mut Dynamic| {
+            let last = syms.last().map(|s| s.as_str()).unwrap_or("");
+            Ok(match (syms.len(), last) {
+                (1, _) => match look {
+                    "until" | "while" => { *state = Dynamic::from(look.to_string()); Some(look.into()) }
+                    "for" => Some("for".into()),
+                    _ => { *state = Dynamic::from("ticks".to_string()); Some("$expr$".into()) }
+                },
+                (2, "for") => { *state = Dynamic::from("ticks".to_string()); Some("$expr$".into()) }
+                (_, "$expr$") if !matches!(state.to_string().as_str(), "until" | "while")
+                    && matches!(look, "ticks" | "tick" | "seconds" | "second" | "secs" | "sec" | "milliseconds" | "millisecond" | "ms") => {
+                    *state = Dynamic::from(look.to_string()); Some(look.into())
+                }
+                (2, "until" | "while") => Some("$expr$".into()),
+                _ => None,
+            })
+        }, false,
+        move |ctx, inputs, state| {
+            let how = state.to_string();
+            if how == "until" || how == "while" {
+                let tape = live.borrow().tape.clone();
+                if !tape.borrow().on { return Err(err("wait cannot pause here: frame and errorDialog handlers run to the end")); }
+                let now_live = tape.borrow_mut().go_live();
+                if now_live { settle(&w, &live); }
+                let at = tape.borrow().entries.len();
+                let c = ctx.eval_expression_tree(&inputs[0])?;
+                let c = c.as_bool().unwrap_or_else(|_| { let t = c.to_string(); t.eq_ignore_ascii_case("true") });
+                if c == (how == "until") || tape.borrow().replaying { return Ok(Dynamic::UNIT); }
+                // Not yet: forget this check's reads (they are read afresh next time), and look again shortly.
+                { let mut t = tape.borrow_mut(); t.entries.truncate(at); t.pos = at; }
+                return Err(pause(&live, Waiting::Poll(now_ms() + 30.0)));
+            }
+            let n = ctx.eval_expression_tree(&inputs[0])?;
+            let n = n.as_float().ok().or_else(|| n.as_int().ok().map(|x| x as f64)).or_else(|| n.to_string().trim().parse().ok()).ok_or_else(|| err("wait needs a number"))?;
+            let ms = match how.as_str() { "seconds" | "second" | "secs" | "sec" => n * 1000.0, "milliseconds" | "millisecond" | "ms" => n, _ => n * 1000.0 / 60.0 };
+            if ms <= 0.0 { return Ok(Dynamic::UNIT); }
+            if pause_point(&w, &live, "wait")?.is_some() { return Ok(Dynamic::UNIT); }
+            Err(pause(&live, Waiting::Until(now_ms() + ms)))
         });
     }
 
@@ -1924,7 +2153,7 @@ impl Rt {
         let w: W = Rc::new(RefCell::new(world));
         let live: L = Rc::new(RefCell::new(Live::default()));
         let engine = build_engine(&w, &live);
-        let rt = Rt { engine, w, live };
+        let rt = Rt { engine, w, live, paused: RefCell::new(None), later: RefCell::new(vec![]) };
         let mut ids: Vec<u32> = rt.w.borrow().file.objs.iter().map(|o| o.id).collect();
         if rt.w.borrow().home.is_some() { ids.push(HOME); }
         for id in ids { rt.compile(id); }
@@ -1948,6 +2177,7 @@ impl Rt {
     /// Run one animation frame: send `frame` to the current card if it has a canvas part.
     /// Returns false when there is nothing to animate.
     pub fn frame(&self) -> bool {
+        if self.is_paused() { return false; }
         let card = self.w.borrow().current_card();
         let has_canvas = { let w = self.w.borrow(); w.parts_on(card).iter().any(|id| w.obj(*id).map(|o| o.kind == Kind::Canvas).unwrap_or(false)) };
         if !has_canvas { return false; }
@@ -1968,63 +2198,28 @@ impl Rt {
 
     /// Send a message with parameters (keyDown "a", arrowKey "left", …), as an automatic change.
     pub fn send_with(&self, obj: u32, msg: &str, args: Vec<Value>) -> bool {
-        { let mut wb = self.w.borrow_mut(); wb.begin(); wb.last_error = None; wb.auto_depth += 1; }
-        let r = dispatch(&self.engine, &self.w, &self.live, obj, msg, args.into_iter().map(to_dyn).collect());
-        { let mut wb = self.w.borrow_mut(); wb.auto_depth -= 1; wb.locked = false; wb.lock_messages = false; }
-        match r { Ok(h) => h, Err(e) => { self.fail(obj, e); false } }
+        self.run(Entry::Send { obj, msgs: vec![(msg.to_string(), args.into_iter().map(to_dyn).collect())], auto: true })
     }
 
-    /// The user closed a dialog. `answer` replies with the button (`answered`), `ask` with the text (`asked`).
-    pub fn reply(&self, text: &str) {
-        let (to, ask) = {
-            let mut wb = self.w.borrow_mut();
-            let to = wb.dialog_reply_to.take();
-            // ask file replies with `asked`, answer file with `answered`
-            let ask = wb.dialog_ask.take().is_some() || wb.dialog_file.as_ref().map(|f| f.0).unwrap_or(false);
-            wb.dialog = None; wb.dialog_buttons.clear(); wb.dialog_file = None;
-            (to, ask)
-        };
-        if let Some(to) = to {
-            if self.w.borrow().obj(to).is_none() { return; }
-            { let mut wb = self.w.borrow_mut(); wb.begin(); wb.last_error = None; }
-            let r = dispatch(&self.engine, &self.w, &self.live, to, if ask { "asked" } else { "answered" }, vec![Dynamic::from(text.to_string())]);
-            { let mut wb = self.w.borrow_mut(); wb.locked = false; wb.lock_messages = false; }
-            if let Err(e) = r { self.fail(to, e); }
-        }
+    /// Send a message into the path, starting at `obj`. Errors land in `world.last_error`.
+    pub fn send(&self, obj: u32, msg: &str) -> bool {
+        self.run(Entry::Send { obj, msgs: vec![(msg.to_string(), vec![])], auto: false })
     }
 
-    /// The player fetched a `load url` request: cache it and tell the object that asked (`urlLoaded <url>`).
-    pub fn url_loaded(&self, url: &str, text: &str, to: u32) {
-        self.w.borrow_mut().url_cache.insert(url.to_string(), text.to_string());
-        if self.w.borrow().obj(to).is_some() { self.send_with(to, "urlLoaded", vec![Value::Str(url.to_string())]); }
-    }
+    /// Run statements as the message box does: in the context of the current card.
+    pub fn exec(&self, text: &str) { self.run(Entry::Exec(text.to_string())); }
 
-    /// A `load url` failed: `urlLoaded <url>, "error"`, with the reason in `the result`.
-    pub fn url_failed(&self, url: &str, why: &str, to: u32) {
-        { let mut wb = self.w.borrow_mut(); wb.url_cache.remove(url); wb.result = why.to_string(); }
-        if self.w.borrow().obj(to).is_some() {
-            { let mut wb = self.w.borrow_mut(); wb.begin(); wb.last_error = None; wb.auto_depth += 1; }
-            let r = dispatch(&self.engine, &self.w, &self.live, to, "urlLoaded", vec![Dynamic::from(url.to_string()), Dynamic::from("error")]);
-            self.w.borrow_mut().auto_depth -= 1;
-            if let Err(e) = r { self.fail(to, e); }
-        }
-    }
-
-    /// Send the `send … in` messages that are due at `now_ms` (ms since 1970). Returns how many were sent.
-    pub fn run_timers(&self, now_ms: f64) -> usize {
-        let due: Vec<(f64, u32, String)> = {
-            let mut wb = self.w.borrow_mut();
-            let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut wb.timers).into_iter().partition(|t| t.0 <= now_ms);
-            wb.timers = rest;
-            due
-        };
-        for (_, obj, msg) in &due { if self.w.borrow().obj(*obj).is_some() { self.send_with(*obj, msg, vec![]); } }
-        due.len()
+    /// Opening a stack: openStack, openBackground, openCard to the current card (and startup first, if asked).
+    pub fn open_stack(&self, startup: bool) {
+        let card = self.w.borrow().current_card();
+        let msgs = ["startup", "openStack", "openBackground", "openCard"].into_iter().filter(|m| startup || *m != "startup").map(|m| (m.to_string(), vec![])).collect();
+        self.run(Entry::Send { obj: card, msgs, auto: true });
     }
 
     /// A click on a button: a button in a family (radio group) lights up and the others in its family go out;
     /// then mouseUp is sent.
     pub fn click(&self, id: u32) -> bool {
+        if self.is_paused() { return false; }
         // A checkBox flips its hilite when clicked, a radioButton turns it on (both only with autoHilite, as in HyperCard).
         {
             let style = self.w.borrow().get(id, "style").text().to_lowercase();
@@ -2047,38 +2242,176 @@ impl Rt {
         self.send(id, "mouseUp")
     }
 
-    /// Opening a stack: openStack, openBackground, openCard to the current card (and startup first, if asked).
-    pub fn open_stack(&self, startup: bool) {
-        let card = self.w.borrow().current_card();
-        for m in ["startup", "openStack", "openBackground", "openCard"].into_iter().filter(|m| startup || *m != "startup") {
-            self.send_with(card, m, vec![]);
-            if self.w.borrow().last_error.is_some() { break; }
+    /// The user closed a dialog: the paused script goes on, with the button or text in `it`.
+    pub fn reply(&self, text: &str) {
+        if self.waiting() == Some(Waiting::Dialog) { self.resume(Some(Dynamic::from(text.to_string()))); }
+    }
+
+    /// The user cancelled a dialog: `it` is empty and the result is "Cancel".
+    pub fn cancel(&self) {
+        if self.waiting() == Some(Waiting::Dialog) { self.resume(Some(Dynamic::UNIT)); }
+    }
+
+    /// Whether a script is paused (the stack is modal until it finishes).
+    pub fn is_paused(&self) -> bool { self.paused.borrow().is_some() }
+
+    /// What the paused script waits for, if one is paused.
+    pub fn waiting(&self) -> Option<Waiting> { if self.is_paused() { self.live.borrow().waiting.clone() } else { None } }
+
+    /// Called by the player every frame: ends a `wait` whose time has come, and checks `wait until`
+    /// conditions again. True if a script ran.
+    pub fn tick(&self, now_ms: f64) -> bool {
+        match self.waiting() {
+            Some(Waiting::Until(t)) if now_ms >= t => { self.resume(Some(Dynamic::from(String::new()))); true }
+            Some(Waiting::Poll(t)) if now_ms >= t => { self.resume(None); true }
+            _ => false,
         }
     }
 
-    /// Send a message into the path, starting at `obj`. Errors land in `world.last_error`.
-    pub fn send(&self, obj: u32, msg: &str) -> bool {
-        { let mut wb = self.w.borrow_mut(); wb.begin(); wb.last_error = None; }
-        let r = dispatch(&self.engine, &self.w, &self.live, obj, msg, vec![]);
-        { let mut wb = self.w.borrow_mut(); wb.locked = false; wb.lock_messages = false; }
+    /// The player fetched a `load url` request: cache it and tell the object that asked (`urlLoaded <url>`).
+    pub fn url_loaded(&self, url: &str, text: &str, to: u32) {
+        if self.is_paused() { let (u, t) = (url.to_string(), text.to_string()); self.later.borrow_mut().push(Box::new(move |rt: &Rt| rt.url_loaded(&u, &t, to))); return; }
+        self.w.borrow_mut().url_cache.insert(url.to_string(), text.to_string());
+        if self.w.borrow().obj(to).is_some() { self.send_with(to, "urlLoaded", vec![Value::Str(url.to_string())]); }
+    }
+
+    /// A `load url` failed: `urlLoaded <url>, "error"`, with the reason in `the result`.
+    pub fn url_failed(&self, url: &str, why: &str, to: u32) {
+        if self.is_paused() { let (u, y) = (url.to_string(), why.to_string()); self.later.borrow_mut().push(Box::new(move |rt: &Rt| rt.url_failed(&u, &y, to))); return; }
+        { let mut wb = self.w.borrow_mut(); wb.url_cache.remove(url); wb.result = why.to_string(); }
+        if self.w.borrow().obj(to).is_some() {
+            self.send_with(to, "urlLoaded", vec![Value::Str(url.to_string()), Value::Str("error".into())]);
+        }
+    }
+
+    /// Send the `send … in` messages that are due at `now_ms` (ms since 1970). Returns how many were sent.
+    /// Nothing is sent while a script is paused.
+    pub fn run_timers(&self, now_ms: f64) -> usize {
+        if self.is_paused() { return 0; }
+        let mut due: std::collections::VecDeque<(f64, u32, String)> = {
+            let mut wb = self.w.borrow_mut();
+            let (due, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut wb.timers).into_iter().partition(|t| t.0 <= now_ms);
+            wb.timers = rest;
+            due.into()
+        };
+        let mut n = 0;
+        while let Some((_, obj, msg)) = due.pop_front() {
+            if self.is_paused() { self.w.borrow_mut().timers.extend(std::iter::once((0.0, obj, msg)).chain(due.drain(..))); break; }
+            if self.w.borrow().obj(obj).is_some() { self.send_with(obj, &msg, vec![]); }
+            n += 1;
+        }
+        n
+    }
+
+    /// Start a run that may pause; refused while another is paused (the stack is modal).
+    fn run(&self, entry: Entry) -> bool {
+        if self.is_paused() { return false; }
+        self.start(entry, vec![], None)
+    }
+
+    fn start(&self, entry: Entry, tape: Vec<(String, Dynamic)>, resume: Option<Dynamic>) -> bool {
+        let snap = self.snapshot();
+        { let mut wb = self.w.borrow_mut(); wb.begin(); wb.last_error = None; wb.journal_floor = snap.mark; wb.floor_merges.clear(); }
+        let tape_rc = self.live.borrow().tape.clone();
+        *tape_rc.borrow_mut() = Tape { on: true, replaying: !tape.is_empty(), entries: tape, resume, ..Default::default() };
+        let real_fs = self.w.borrow().fs.clone();
+        self.w.borrow_mut().fs = Rc::new(RefCell::new(Box::new(TapeFs { inner: real_fs.clone(), tape: tape_rc.clone() })));
+        let r = self.exec_entry(&entry);
+        { let mut wb = self.w.borrow_mut(); wb.fs = real_fs; wb.journal_floor = 0; wb.locked = false; wb.lock_messages = false; }
+        let (entries, diverged) = { let mut t = tape_rc.borrow_mut(); t.on = false; (std::mem::take(&mut t.entries), t.diverged.take()) };
+        // A run that went a different way the second time may end before its pause point.
+        settle(&self.w, &self.live);
+        if let Some(d) = diverged { self.w.borrow_mut().log.push(format!("note: a paused script ran differently when it went on ({d})")); }
         match r {
-            Ok(h) => h,
-            Err(e) => { self.fail(obj, e); false }
+            Err(e) if is_pause(&e) => {
+                self.live.borrow_mut().frames.clear();
+                *self.paused.borrow_mut() = Some(Paused { entry, snap, tape: entries });
+                true
+            }
+            r => {
+                self.live.borrow_mut().waiting = None;
+                let h = match r { Ok(h) => h, Err(e) => { let obj = match &entry { Entry::Send { obj, .. } => *obj, Entry::Exec(_) => self.w.borrow().current_card() }; self.fail(obj, e); false } };
+                self.run_later();
+                h
+            }
         }
     }
 
-    /// Run statements as the message box does: in the context of the current card.
-    pub fn exec(&self, text: &str) {
-        { let mut wb = self.w.borrow_mut(); wb.begin(); wb.last_error = None; }
-        let card = self.w.borrow().current_card();
-        let ast = match self.engine.compile(&hypertalk_words(&hypertalk_blocks(text))) { Ok(a) => a, Err(e) => { self.w.borrow_mut().last_error = Some(format!("message box: {e}")); return; } };
-        self.live.borrow_mut().frames.push(Frame { obj: card, target: card, msg: "\u{0}".into(), args: vec![], handled: false, passed: false, globals: vec![], ret: None });
-        let res = self.engine.eval_ast_with_scope::<Dynamic>(&mut Scope::new(), &ast);
-        self.live.borrow_mut().frames.pop();
-        match res {
-            Ok(v) if !v.is_unit() => self.w.borrow_mut().log.push(v.to_string()),
-            Ok(_) => {}
-            Err(e) => self.fail(card, e),
+    fn exec_entry(&self, entry: &Entry) -> R<bool> {
+        match entry {
+            Entry::Send { obj, msgs, auto } => {
+                if *obj != HOME && *obj < LIB0 && self.w.borrow().obj(*obj).is_none() { return Ok(false); }
+                if *auto { self.w.borrow_mut().auto_depth += 1; }
+                let mut r = Ok(false);
+                for (m, a) in msgs {
+                    match dispatch(&self.engine, &self.w, &self.live, *obj, m, a.clone()) {
+                        Ok(h) => r = Ok(r.unwrap_or(false) || h),
+                        Err(e) => { r = Err(e); break; }
+                    }
+                }
+                if *auto { self.w.borrow_mut().auto_depth -= 1; }
+                r
+            }
+            Entry::Exec(text) => {
+                let card = self.w.borrow().current_card();
+                let ast = match self.engine.compile(&hypertalk_words(&hypertalk_blocks(text))) { Ok(a) => a, Err(e) => { self.w.borrow_mut().last_error = Some(format!("message box: {e}")); return Ok(false); } };
+                self.live.borrow_mut().frames.push(Frame { obj: card, target: card, msg: "\u{0}".into(), args: vec![], handled: false, passed: false, globals: vec![], ret: None });
+                let res = self.engine.eval_ast_with_scope::<Dynamic>(&mut Scope::new(), &ast);
+                self.live.borrow_mut().frames.pop();
+                let v = res?;
+                if !v.is_unit() { self.w.borrow_mut().log.push(v.to_string()); }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Go on with the paused script: roll back what it did, run it again with what it saw on the tape,
+    /// and give the pause point `reply`.
+    fn resume(&self, reply: Option<Dynamic>) {
+        let Some(p) = self.paused.borrow_mut().take() else { return };
+        {
+            let wb = self.w.borrow();
+            self.live.borrow_mut().settle = Some(Settle { sounds: wb.sound_cmds.len(), urls: wb.url_requests.len(), go: wb.go_stack.clone(), edit: wb.edit_request });
+        }
+        self.live.borrow_mut().waiting = None;
+        self.restore(p.snap);
+        self.start(p.entry, p.tape, reply);
+    }
+
+    fn snapshot(&self) -> Snap {
+        let wb = self.w.borrow();
+        Snap {
+            mark: wb.file.journal.len(), txn: wb.file.txn, next_id: wb.file.next_id, current_card: wb.file.current_card,
+            log_len: wb.log.len(), result: wb.result.clone(), item_delim: wb.item_delim.clone(), timers: wb.timers.clone(),
+            push_list: wb.push_list.clone(), selection: wb.selection, focused: wb.focused, user_level: wb.user_level,
+            open_files: wb.open_files.clone(), effect: wb.effect.clone(), effect_seq: wb.effect_seq, sound: wb.sound.clone(),
+            draw: wb.draw.clone(), mouse_click: wb.mouse_click, click_loc: wb.click_loc, libs: wb.libs.clone(),
+            globals: self.live.borrow().globals.clone(), seed: rand_seed(),
+        }
+    }
+
+    fn restore(&self, s: Snap) {
+        let ids = {
+            let mut wb = self.w.borrow_mut();
+            let ids = wb.rollback(s.mark);
+            wb.file.txn = s.txn; wb.file.next_id = s.next_id; wb.file.current_card = s.current_card;
+            wb.log.truncate(s.log_len); wb.result = s.result; wb.item_delim = s.item_delim; wb.timers = s.timers;
+            wb.push_list = s.push_list; wb.selection = s.selection; wb.focused = s.focused; wb.user_level = s.user_level;
+            wb.open_files = s.open_files; wb.effect = s.effect; wb.effect_seq = s.effect_seq; wb.sound = s.sound;
+            wb.draw = s.draw; wb.mouse_click = s.mouse_click; wb.click_loc = s.click_loc; wb.libs = s.libs;
+            wb.dialog = None; wb.dialog_buttons.clear(); wb.dialog_ask = None; wb.dialog_file = None;
+            ids
+        };
+        self.live.borrow_mut().globals = s.globals;
+        set_rand_seed(s.seed);
+        for id in ids { self.compile(id); }
+    }
+
+    /// Work that waited for a paused script.
+    fn run_later(&self) {
+        while !self.is_paused() {
+            let next = { let mut l = self.later.borrow_mut(); if l.is_empty() { None } else { Some(l.remove(0)) } };
+            match next { Some(f) => f(self), None => break }
         }
     }
 
@@ -2100,6 +2433,7 @@ impl Rt {
     }
 
     pub fn undo(&self) {
+        if self.is_paused() { return; }
         let ids = self.w.borrow_mut().undo();
         for id in ids { self.compile(id); }
     }
@@ -2112,11 +2446,9 @@ impl Rt {
     /// The player reports that the current sound has ended: clear `the sound`, send `soundDone`.
     pub fn sound_finished(&self) {
         if self.w.borrow_mut().sound.take().is_none() { return; }
+        if self.is_paused() { self.later.borrow_mut().push(Box::new(|rt: &Rt| { let card = rt.w.borrow().current_card(); rt.send_with(card, "soundDone", vec![]); })); return; }
         let card = self.w.borrow().current_card();
-        { let mut wb = self.w.borrow_mut(); wb.begin(); wb.auto_depth += 1; }
-        let r = dispatch(&self.engine, &self.w, &self.live, card, "soundDone", vec![]);
-        self.w.borrow_mut().auto_depth -= 1;
-        if let Err(e) = r { self.fail(card, e); }
+        self.send_with(card, "soundDone", vec![]);
     }
 
     /// The Home stack as its own file, or None when there is no Home.
@@ -2859,7 +3191,7 @@ const KNOWN_STATEMENT_WORDS: &[&str] = &[
     "let", "const", "if", "else", "while", "loop", "for", "do", "return", "break", "continue", "fn", "switch", "throw", "try", "catch",
     "import", "export", "private", "print", "debug", "true", "false", "this",
     // this language
-    "on", "function", "end", "pass", "exit", "next", "repeat", "global", "put", "get", "set", "go", "answer", "ask", "find", "beep",
+    "on", "function", "end", "pass", "exit", "next", "repeat", "global", "put", "get", "set", "go", "answer", "ask", "wait", "find", "beep",
     "send", "new", "hide", "show", "enable", "disable", "mark", "unmark", "play", "lock", "unlock", "with", "add", "subtract",
     "multiply", "divide", "do", "sort", "push", "pop", "edit", "select", "click", "type", "create", "convert", "file", "open", "close",
     "read", "write", "delete", "rename", "load", "url", "start", "stop", "there", "the", "me", "it", "target", "field", "button",

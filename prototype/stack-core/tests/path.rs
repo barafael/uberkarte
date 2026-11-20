@@ -1,4 +1,4 @@
-use stack_core::{demo, Kind, Rt, StackFile, Value};
+use stack_core::{demo, Kind, Rt, StackFile, Value, Waiting};
 
 fn part(rt: &Rt, kind: Kind, name: &str) -> u32 { rt.w.borrow().find_part(kind, &Value::Str(name.into())).unwrap() }
 fn field(rt: &Rt, name: &str) -> String { let id = part(rt, Kind::Field, name); rt.w.borrow().get(id, "text").text() }
@@ -29,6 +29,7 @@ fn answer_find_new_and_undo() {
     let rt = Rt::new(demo::address_book());
     rt.send(part(&rt, Kind::Button, "Hello"), "mouseUp"); no_error(&rt);
     assert_eq!(rt.w.borrow().dialog.as_deref(), Some("Hello, Ada"));
+    rt.reply("OK");
 
     let s = part(&rt, Kind::Field, "search");
     rt.w.borrow_mut().set(s, "text", "nanoseconds".into(), false);
@@ -156,11 +157,13 @@ fn home_is_last_on_the_path() {
     let rt = Rt::with_home(demo::address_book(), Some(demo::home()));
     rt.exec(r#"send "help";"#); no_error(&rt);
     assert_eq!(rt.w.borrow().dialog.as_deref(), Some("Messages travel: part, card, background, stack, Home."));
+    rt.reply("OK");
     // The stack's own handler wins over Home's.
     let stack = rt.w.borrow().stack_id();
     rt.set_script(stack, "on help { answer \"stack help\"; }");
     rt.exec(r#"send "help";"#);
     assert_eq!(rt.w.borrow().dialog.as_deref(), Some("stack help"));
+    rt.reply("OK");
     // A live edit of Home's script applies to every stack, and Home round-trips as its own file.
     rt.set_script(stack, "");
     rt.set_script(stack_core::HOME, "on help { answer \"edited home\"; }");
@@ -216,6 +219,7 @@ fn stacks_from_format_1_are_migrated() {
     let rt = Rt::new(f);
     rt.send(part(&rt, Kind::Button, "Hello"), "mouseUp"); no_error(&rt);
     assert_eq!(rt.w.borrow().dialog.as_deref(), Some("Hello, Ada"));
+    rt.reply("OK");
 }
 
 #[test]
@@ -370,6 +374,7 @@ on help { put " help" after field "notes"; pass help; }"#);
     rt.exec(r#"send "help";"#); no_error(&rt);
     assert_eq!(field(&rt, "notes"), "startup openStack mouseDown enter:Hello key:a arrow:left:1:left openField help");
     assert_eq!(rt.w.borrow().dialog.as_deref(), Some("Messages travel: part, card, background, stack, Home."), "pass help reached Home");
+    rt.reply("OK");
     // newCard goes to the new card once it exists.
     rt.exec("new card;"); no_error(&rt);
     assert_eq!(field(&rt, "status"), "Card 1 newCard:2", "the new card is inserted after card 1");
@@ -454,25 +459,129 @@ fn hypertalk_word_pairs_and_comments() {
     }
 }
 
+fn mem_fs(rt: &Rt) {
+    rt.w.borrow_mut().fs = std::rc::Rc::new(std::cell::RefCell::new(Box::new(stack_core::files::MemFs::new())));
+    rt.w.borrow_mut().fs_base = "/".into();
+}
+
 #[test]
-fn dialogs_reply_by_message() {
+fn answer_and_ask_wait_for_the_reply_in_it() {
     let rt = Rt::new(demo::address_book());
     let hello = part(&rt, Kind::Button, "Hello");
-    rt.set_script(hello, r#"on mouseUp { answer "Save changes?" with "Yes" or "No" or "Cancel"; }
-on answered choice { put "chose " & choice into field "notes"; }
-on mouseDown { ask "Your name?" with "Ada"; }
-on asked reply { put "name " & reply into field "search"; }"#);
+    rt.set_script(hello, r#"on mouseUp
+  answer "Save changes?" with "Yes" or "No" or "Cancel"
+  put "chose " & it into field "notes"
+end mouseUp
+on mouseDown
+  ask "Your name?" with "Ada"
+  if the result is "Cancel" then put "cancelled" into field "search"
+  else put "name " & it into field "search"
+end mouseDown"#);
     assert_eq!(rt.script_error(hello), None);
     rt.send(hello, "mouseUp"); no_error(&rt);
     assert_eq!(rt.w.borrow().dialog.as_deref(), Some("Save changes?"));
     assert_eq!(rt.w.borrow().dialog_buttons, vec!["Yes", "No", "Cancel"]);
-    rt.reply("No");
+    assert_eq!(rt.waiting(), Some(Waiting::Dialog));
+    // Modal: nothing else runs while the script waits.
+    assert!(!rt.send(hello, "mouseDown"));
+    rt.reply("No"); no_error(&rt);
     assert_eq!(field(&rt, "notes"), "chose No");
     assert_eq!(rt.w.borrow().dialog, None);
+    assert!(!rt.is_paused());
     rt.send(hello, "mouseDown"); no_error(&rt);
     assert_eq!(rt.w.borrow().dialog_ask.as_deref(), Some("Ada"));
     rt.reply("Grace");
     assert_eq!(field(&rt, "search"), "name Grace");
+    rt.send(hello, "mouseDown");
+    rt.cancel(); no_error(&rt);
+    assert_eq!(field(&rt, "search"), "cancelled");
+}
+
+#[test]
+fn a_paused_script_does_nothing_twice() {
+    let rt = Rt::new(demo::address_book());
+    mem_fs(&rt);
+    let hello = part(&rt, Kind::Button, "Hello");
+    // Changes before the pause, a global, a file append, random numbers, a loop with two dialogs.
+    rt.set_script(hello, r#"on mouseUp
+  global gCount
+  add 1 to gCount
+  put random(1000000) into r
+  put r into field "notes"
+  put "x" after file "log.txt"
+  repeat with i = 1 to 2
+    answer "Round " & i with "A" or "B"
+    put it after field "search"
+  end repeat
+  put return & r & "/" & gCount & "/" & file "log.txt" after field "notes"
+end mouseUp"#);
+    assert_eq!(rt.script_error(hello), None);
+    rt.exec(r#"put empty into field "search""#);
+    rt.send(hello, "mouseUp"); no_error(&rt);
+    let first = field(&rt, "notes");
+    assert_eq!(rt.w.borrow().dialog.as_deref(), Some("Round 1"));
+    rt.reply("A"); no_error(&rt);
+    assert_eq!(rt.w.borrow().dialog.as_deref(), Some("Round 2"));
+    assert_eq!(field(&rt, "search"), "A");
+    rt.reply("B"); no_error(&rt);
+    assert!(!rt.is_paused());
+    assert_eq!(field(&rt, "search"), "AB");
+    assert_eq!(field(&rt, "notes"), format!("{first}\n{first}/1/x"));
+    assert_eq!(rt.w.borrow().fs.borrow().read("/log.txt").unwrap(), "x");
+    // One Undo takes back the whole click.
+    rt.undo();
+    assert_eq!(field(&rt, "search"), "");
+}
+
+#[test]
+fn wait_for_time_and_for_a_condition() {
+    let rt = Rt::new(demo::address_book());
+    let hello = part(&rt, Kind::Button, "Hello");
+    rt.set_script(hello, r#"on mouseUp
+  put "1" into field "notes"
+  wait 6 ticks
+  put "2" after field "notes"
+  wait for 0.5 seconds
+  put "3" after field "notes"
+  wait until the mouse is down
+  put "4" after field "notes"
+  wait while the mouse is down
+  put "5" after field "notes"
+end mouseUp"#);
+    assert_eq!(rt.script_error(hello), None);
+    let now = || web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).unwrap().as_secs_f64() * 1000.0;
+    rt.send(hello, "mouseUp"); no_error(&rt);
+    assert_eq!(field(&rt, "notes"), "1");
+    let Some(Waiting::Until(t)) = rt.waiting() else { panic!("{:?}", rt.waiting()) };
+    assert!(t - now() > 50.0 && t - now() <= 101.0);
+    assert!(!rt.tick(now()));
+    assert!(rt.tick(t)); no_error(&rt);
+    assert_eq!(field(&rt, "notes"), "12");
+    let Some(Waiting::Until(t)) = rt.waiting() else { panic!() };
+    assert!(rt.tick(t + 1.0)); no_error(&rt);
+    assert_eq!(field(&rt, "notes"), "123");
+    let Some(Waiting::Poll(t)) = rt.waiting() else { panic!("{:?}", rt.waiting()) };
+    assert!(rt.tick(t)); no_error(&rt);
+    assert_eq!(field(&rt, "notes"), "123", "still up");
+    rt.w.borrow_mut().mouse_down = true;
+    let Some(Waiting::Poll(t)) = rt.waiting() else { panic!() };
+    assert!(rt.tick(t)); no_error(&rt);
+    assert_eq!(field(&rt, "notes"), "1234");
+    rt.w.borrow_mut().mouse_down = false;
+    let Some(Waiting::Poll(t)) = rt.waiting() else { panic!("{:?}", rt.waiting()) };
+    assert!(rt.tick(t)); no_error(&rt);
+    assert_eq!(field(&rt, "notes"), "12345");
+    assert!(!rt.is_paused());
+}
+
+#[test]
+fn frame_handlers_cannot_pause() {
+    let rt = Rt::new(demo::breakout());
+    let card = rt.w.borrow().current_card();
+    rt.set_script(card, "on frame\n  wait 1 tick\nend frame");
+    rt.frame();
+    assert!(rt.w.borrow().last_error.as_deref().unwrap_or("").contains("cannot pause"), "{:?}", rt.w.borrow().last_error);
+    assert!(!rt.is_paused());
 }
 
 #[test]
@@ -788,11 +897,10 @@ fn file_io() {
     assert_eq!(field(&rt, "search"), "hello!");
     let changes = rt.w.borrow().fs.borrow_mut().take_changes();
     assert_eq!(changes.iter().map(|c| (c.0.as_str(), c.1.as_str())).collect::<Vec<_>>(), vec![("write", "/greeting.txt"), ("folder", "/box")]);
-    // answer file / ask file reply by message; load url / url via the cache.
+    // answer file puts the path into it; load url / url via the cache.
     let card = rt.w.borrow().current_card();
-    rt.set_script(card, r#"on answered p { put "picked " & p into field "notes"; }
-on urlLoaded u { put "loaded " & u & ": " & url u into field "notes"; }"#);
-    rt.exec(r#"answer file "Pick a text file";"#); no_error(&rt);
+    rt.set_script(card, r#"on urlLoaded u { put "loaded " & u & ": " & url u into field "notes"; }"#);
+    rt.exec(r#"answer file "Pick a text file"; put "picked " & it into field "notes";"#); no_error(&rt);
     assert!(rt.w.borrow().dialog_file.is_some());
     rt.reply("/greeting.txt");
     assert_eq!(field(&rt, "notes"), "picked /greeting.txt");
@@ -823,12 +931,15 @@ fn libraries_and_other_stacks() {
     assert_eq!(field(&rt, "notes"), "in use", "libraryStack was sent");
     // Its handlers sit between this stack and Home on the message path.
     rt.exec(r#"send "shout" ; put the stacksInUse into field "search";"#); no_error(&rt);
+    rt.reply("OK");
     assert_eq!(field(&rt, "search"), "Utilities");
     let card = rt.w.borrow().current_card();
     rt.send_with(card, "shout", vec![Value::Str("hi".into())]); no_error(&rt);
     assert_eq!(rt.w.borrow().dialog.as_deref(), Some("SHOUT: hi"));
+    rt.reply("OK");
     rt.exec(r#"send "help";"#); no_error(&rt);
     assert_eq!(rt.w.borrow().dialog.as_deref(), Some("Messages travel: part, card, background, stack, Home."), "Home still last");
+    rt.reply("OK");
     rt.exec(r#"stop using stack "Utilities"; put the stacksInUse into field "search";"#); no_error(&rt);
     assert_eq!(field(&rt, "search"), "");
     // go to stack: a request for the player, found by search or as a demo by name.
@@ -909,6 +1020,13 @@ fn self_test_stack_passes() {
     rt.w.borrow_mut().fs_base = dir.to_string_lossy().into_owned();
     for id in rt.w.borrow().file.objs.iter().map(|o| o.id).collect::<Vec<_>>() { assert_eq!(rt.script_error(id), None, "script of {id}"); }
     rt.send(part(&rt, Kind::Button, "Run all tests"), "mouseUp"); no_error(&rt);
+    // The run pauses at `wait 3 ticks`, then runs again from the click, replaying what it read.
+    assert!(matches!(rt.waiting(), Some(Waiting::Until(_))), "{:?}", rt.waiting());
+    while let Some(Waiting::Until(_)) = rt.waiting() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        rt.tick(web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).unwrap().as_secs_f64() * 1000.0);
+    }
+    no_error(&rt);
     let out = field(&rt, "results");
     println!("{out}");
     assert!(!out.contains("FAIL"), "{out}");
