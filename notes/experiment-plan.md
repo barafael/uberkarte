@@ -1191,5 +1191,5 @@ to right, and unary minus binds tighter than `^`.
   - the Self Test (29/29) and the pause checks still pass.
 - Not checked: `moveWindow`, since a headless window doesn't move.
 
-**Known difference:** card paint sits behind all parts. In HyperCard it lies
-above the background's parts.
+**Layers:** as in HyperCard, card paint lies above the background's parts
+and below the card's own parts.

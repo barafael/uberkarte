@@ -374,7 +374,7 @@ fn main() {
 const RAF: &str = "function f(t){ dioxus.send(t); requestAnimationFrame(f); } requestAnimationFrame(f);";
 
 #[derive(Clone, PartialEq)]
-struct PartView { style: String, id: u32, kind: Kind, name: String, text: String, x: i64, y: i64, w: i64, h: i64, locked: bool, visible: bool, transparent: bool, picture: String, enabled: bool, hilite: bool, show_name: bool, dont_wrap: bool, icon: String, auto_hilite: bool }
+struct PartView { style: String, id: u32, kind: Kind, name: String, text: String, x: i64, y: i64, w: i64, h: i64, locked: bool, visible: bool, transparent: bool, picture: String, enabled: bool, hilite: bool, show_name: bool, dont_wrap: bool, icon: String, auto_hilite: bool, bg: bool }
 
 fn part_views() -> Vec<PartView> {
     let r = rt();
@@ -386,7 +386,8 @@ fn part_views() -> Vec<PartView> {
             locked: o.props.get("locked").map(|v| v.truthy()).unwrap_or(false), visible: o.props.get("visible").map(|v| v.truthy()).unwrap_or(true),
             transparent: o.props.get("style").map(|v| v.text() == "transparent").unwrap_or(false), picture: o.props.get("picture").map(|v| v.text()).unwrap_or_default(),
             enabled: w.get(id, "enabled").truthy(), hilite: w.get(id, "hilite").truthy(), show_name: w.get(id, "showName").truthy(), dont_wrap: w.get(id, "dontWrap").truthy(),
-            icon: o.props.get("icon").map(|v| v.text()).unwrap_or_default(), auto_hilite: w.get(id, "autoHilite").truthy() })
+            icon: o.props.get("icon").map(|v| v.text()).unwrap_or_default(), auto_hilite: w.get(id, "autoHilite").truthy(),
+            bg: o.parent.and_then(|p| w.obj(p)).map(|p| p.kind == Kind::Background).unwrap_or(false) })
     })
     // showPict false on a card or background hides the pictures that belong to it.
     .map(|mut p| { if p.kind == Kind::Picture { let owner = w.obj(p.id).and_then(|o| o.parent); if owner.map(|o| !w.get(o, "showPict").truthy()).unwrap_or(false) { p.visible = false; } } p })
@@ -527,7 +528,7 @@ input.t { font:inherit; padding:4px 8px; border:1px solid var(--line); border-ra
 .menubar .sep { border-top:1px dotted #999; margin:3px 0; }
 .menubar .toolpick { display:flex; gap:6px; align-items:center; color:var(--muted); }
 .menubar .sp { flex:1; }
-.paintlayer { position:absolute; inset:0; pointer-events:none; }
+.paintlayer { position:absolute; inset:0; pointer-events:none; z-index:2; }
 .paintlayer svg { display:block; }
 .paintcatch { position:absolute; inset:0; z-index:40; cursor:crosshair; }
 label.t { display:inline-flex; align-items:center; font:inherit; padding:4px 10px; border:1px solid var(--line); background:#fff; border-radius:4px; cursor:pointer; }
@@ -1076,7 +1077,8 @@ fn App() -> Element {
                                 class: match (editing && multi().contains(&p.id), p.kind, p.visible) { (true, _, _) => if sel() == Some(p.id) { "part sel" } else { "part sel also" }, (_, _, false) => "part hidden", (false, Kind::Canvas, _) => "part canvas", (false, Kind::Picture, _) => "part picture", _ => "part" },
                                 style: {
                                     let (ox, oy) = match drag() { Some((_, _, dx, dy)) if multi().contains(&p.id) => (dx.round() as i64, dy.round() as i64), _ => (0, 0) };
-                                    format!("left:{}px;top:{}px;width:{}px;height:{}px;", p.x + ox, p.y + oy, p.w, p.h)
+                                    // HyperCard's layers: background parts, then the card's paint, then card parts.
+                                    format!("left:{}px;top:{}px;width:{}px;height:{}px;z-index:{};", p.x + ox, p.y + oy, p.w, p.h, if p.bg { 1 } else { 3 })
                                 },
                                 title: "{p.name}",
                                 onmouseenter: move |_| { if !editing && p.kind != Kind::Picture { rt().w.borrow_mut().hover = Some(p.id); rt().send_with(p.id, "mouseEnter", vec![]); done(); } },
